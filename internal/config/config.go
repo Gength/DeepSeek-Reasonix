@@ -909,6 +909,12 @@ type AgentConfig struct {
 	// PlanModeAllowedTools names extra custom tools the plan-mode policy may treat
 	// as read-only. It cannot unlock known blocked tools or unsafe bash commands.
 	PlanModeAllowedTools []string `toml:"plan_mode_allowed_tools"`
+	// PlannerAllowedTools names MCP tools the planner is allowed to see.
+	// MCP tools are opt-in for the planner: when empty, no MCP tools are
+	// available to the planner; when populated, only the listed MCP tools
+	// (by model-visible name, e.g. "mcp__github__search_issues") are exposed.
+	// Built-in read-only tools are unaffected by this setting.
+	PlannerAllowedTools []string `toml:"planner_allowed_tools"`
 	// MemoryCompiler controls the v5 execution-memory compiler. Missing configs
 	// default to enabled so users get the self-improving planner unless they opt
 	// out explicitly.

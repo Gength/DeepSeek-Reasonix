@@ -725,3 +725,192 @@ func TestCoordinatorSetPlanModeNilSafety(t *testing.T) {
 	c.SetPlanMode(true)  // should not panic
 	c.SetPlanMode(false) // should not panic
 }
+
+// TestCoordinatorPlanModeSkipsExecutor verifies that when planMode is true, Run()
+// stops after planning and does not invoke the executor.
+func TestCoordinatorPlanModeSkipsExecutor(t *testing.T) {
+	planner := &mockProvider{name: "planner", chunks: []provider.Chunk{
+		{Type: provider.ChunkText, Text: "1. fix the loop"},
+		{Type: provider.ChunkDone},
+	}}
+	// Executor that should NOT be called — fail if it is.
+	exec := &mockProvider{name: "executor"}
+	executor := New(exec, tool.NewRegistry(), NewSession("exec-sys"), Options{}, event.Discard)
+	plannerSess := NewSession("planner-sys")
+	coord := NewCoordinator(planner, plannerSess, nil, nil, Options{}, executor, 0, event.Discard, nil)
+
+	// Enable plan mode
+	coord.SetPlanMode(true)
+	if !coord.planMode {
+		t.Fatal("planMode should be true after SetPlanMode(true)")
+	}
+
+	if err := coord.Run(context.Background(), "fix the bug in parser"); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+
+	// Planner should have been called
+	if planner.lastReq.Messages == nil {
+		t.Error("planner should have been called")
+	}
+	// Executor should NOT have been called
+	if exec.lastReq.Messages != nil {
+		t.Errorf("executor was called in plan mode; messages=%v", exec.lastReq.Messages)
+	}
+	// Planner session should contain system + user + plan (3 messages)
+	if n := len(plannerSess.Messages); n != 3 {
+		t.Errorf("planner session has %d messages, want 3", n)
+	}
+	// Executor's session should contain the plan (added for approval flow)
+	if n := len(executor.Session().Messages); n != 2 {
+		t.Errorf("executor session has %d messages, want 2 (system + plan)", n)
+	} else if executor.Session().Messages[1].Role != provider.RoleAssistant || executor.Session().Messages[1].Content != "1. fix the loop" {
+		t.Errorf("executor session last message = %+v, want assistant/1. fix the loop", executor.Session().Messages[1])
+	}
+}
+
+// TestCoordinatorPlanModeFalseStillInvokesExecutor verifies that when planMode is
+// false (the default), Run() invokes the executor normally after planning.
+func TestCoordinatorPlanModeFalseStillInvokesExecutor(t *testing.T) {
+	planner := &mockProvider{name: "planner", chunks: []provider.Chunk{
+		{Type: provider.ChunkText, Text: "add logging"},
+		{Type: provider.ChunkDone},
+	}}
+	exec := &mockProvider{name: "executor", chunks: []provider.Chunk{
+		{Type: provider.ChunkText, Text: "done."},
+		{Type: provider.ChunkDone},
+	}}
+	executor := New(exec, tool.NewRegistry(), NewSession("exec-sys"), Options{}, event.Discard)
+	plannerSess := NewSession("planner-sys")
+	coord := NewCoordinator(planner, plannerSess, nil, nil, Options{}, executor, 0, event.Discard, nil)
+
+	// Default planMode is false
+	if coord.planMode {
+		t.Fatal("planMode should default to false")
+	}
+
+	if err := coord.Run(context.Background(), "add logging"); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+
+	// Both should have been called
+	if planner.lastReq.Messages == nil {
+		t.Error("planner should have been called")
+	}
+	if exec.lastReq.Messages == nil {
+		t.Error("executor should have been called when planMode=false")
+	}
+}
+
+// TestCoordinatorCaptureExecutorSummary verifies that captureExecutorSummary reads
+// the last assistant message from the executor's session.
+func TestCoordinatorCaptureExecutorSummary(t *testing.T) {
+	sess := NewSession("exec-sys")
+	sess.Add(provider.Message{Role: provider.RoleUser, Content: "do something"})
+	sess.Add(provider.Message{Role: provider.RoleAssistant, Content: "I changed main.go and added tests."})
+	sess.Add(provider.Message{Role: provider.RoleUser, Content: "also fix"})
+	sess.Add(provider.Message{Role: provider.RoleAssistant, Content: "Fixed the lexer too."})
+
+	executor := New(&mockProvider{name: "executor"}, tool.NewRegistry(), sess, Options{}, event.Discard)
+	plannerSess := NewSession("planner-sys")
+	coord := NewCoordinator(&mockProvider{name: "planner"}, plannerSess, nil, nil, Options{}, executor, 0, event.Discard, nil)
+
+	coord.captureExecutorSummary()
+	if coord.lastExecutorSummary != "Fixed the lexer too." {
+		t.Errorf("lastExecutorSummary = %q, want %q", coord.lastExecutorSummary, "Fixed the lexer too.")
+	}
+}
+
+// TestCoordinatorCaptureExecutorSummaryEmptySession verifies nil-safety when the
+// executor session is empty or has no assistant messages.
+func TestCoordinatorCaptureExecutorSummaryEmptySession(t *testing.T) {
+	// No session at all
+	coord1 := &Coordinator{}
+	coord1.captureExecutorSummary() // should not panic
+	if coord1.lastExecutorSummary != "" {
+		t.Error("summary should be empty for nil executor")
+	}
+
+	// Executor with nil session
+	sess := NewSession("exec-sys")
+	exec := New(&mockProvider{name: "executor"}, tool.NewRegistry(), sess, Options{}, event.Discard)
+	coord2 := NewCoordinator(&mockProvider{name: "planner"}, NewSession("planner-sys"), nil, nil, Options{}, exec, 0, event.Discard, nil)
+	coord2.executor.session = nil
+	coord2.captureExecutorSummary() // should not panic
+	if coord2.lastExecutorSummary != "" {
+		t.Error("summary should be empty when executor session is nil")
+	}
+}
+
+// TestCoordinatorCaptureExecutorSummaryPreservesLongSummary verifies that
+// captureExecutorSummary preserves the full content without truncation, matching
+// the planner→executor formatHandoff behavior.
+func TestCoordinatorCaptureExecutorSummaryPreservesLongSummary(t *testing.T) {
+	long := strings.Repeat("a", 3000)
+	sess := NewSession("exec-sys")
+	sess.Add(provider.Message{Role: provider.RoleAssistant, Content: long})
+
+	executor := New(&mockProvider{name: "executor"}, tool.NewRegistry(), sess, Options{}, event.Discard)
+	coord := NewCoordinator(&mockProvider{name: "planner"}, NewSession("planner-sys"), nil, nil, Options{}, executor, 0, event.Discard, nil)
+
+	coord.captureExecutorSummary()
+	if len(coord.lastExecutorSummary) != 3000 {
+		t.Errorf("summary length = %d, want 3000 (full content preserved)", len(coord.lastExecutorSummary))
+	}
+	if coord.lastExecutorSummary != long {
+		t.Error("summary content should be preserved in full")
+	}
+}
+
+// TestCoordinatorLastExecutorSummaryInjected verifies that on the next Run(), the
+// cached lastExecutorSummary is injected into the planner's input.
+func TestCoordinatorLastExecutorSummaryInjected(t *testing.T) {
+	planner := &mockProvider{name: "planner", chunks: []provider.Chunk{
+		{Type: provider.ChunkText, Text: "plan"},
+		{Type: provider.ChunkDone},
+	}}
+	exec := &mockProvider{name: "executor", chunks: []provider.Chunk{
+		{Type: provider.ChunkText, Text: "Done."},
+		{Type: provider.ChunkDone},
+	}}
+	executor := New(exec, tool.NewRegistry(), NewSession("exec-sys"), Options{}, event.Discard)
+	plannerSess := NewSession("planner-sys")
+	coord := NewCoordinator(planner, plannerSess, nil, nil, Options{}, executor, 0, event.Discard, nil)
+
+	// Set the summary as if a previous executor run produced it
+	coord.lastExecutorSummary = "I changed main.go and added tests."
+
+	if err := coord.Run(context.Background(), "now fix the lexer"); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+
+	// The planner should have seen the summary in its input
+	lastUserMsg := lastUser(planner.lastReq)
+	if !strings.Contains(lastUserMsg, "Previous execution summary") {
+		t.Errorf("planner input should contain summary marker, got: %s", lastUserMsg)
+	}
+	if !strings.Contains(lastUserMsg, "changed main.go") {
+		t.Errorf("planner input should contain summary content, got: %s", lastUserMsg)
+	}
+}
+
+// TestCoordinatorResetPlannerSessionClearsSummary verifies that ResetPlannerSession
+// clears the cached executor summary.
+func TestCoordinatorResetPlannerSessionClearsSummary(t *testing.T) {
+	sess := NewSession("exec-sys")
+	sess.Add(provider.Message{Role: provider.RoleAssistant, Content: "done"})
+	executor := New(&mockProvider{name: "executor"}, tool.NewRegistry(), sess, Options{}, event.Discard)
+	coord := NewCoordinator(&mockProvider{name: "planner"}, NewSession("planner-sys"), nil, nil, Options{}, executor, 0, event.Discard, nil)
+
+	// Capture summary
+	coord.captureExecutorSummary()
+	if coord.lastExecutorSummary == "" {
+		t.Fatal("summary should be non-empty after capture")
+	}
+
+	// Reset planner session
+	coord.ResetPlannerSession()
+	if coord.lastExecutorSummary != "" {
+		t.Error("summary should be cleared after ResetPlannerSession")
+	}
+}

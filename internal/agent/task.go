@@ -587,12 +587,53 @@ var plannerNonResearchTools = []string{
 }
 
 // PlannerToolRegistry returns the tool set exposed to the two-model planner:
-// read-only research tools only. It deliberately excludes workflow/meta tools
-// that are technically read-only but can prompt the user, update visible task
-// state, wait on jobs, or expand commands instead of inspecting context.
-func PlannerToolRegistry(parent *tool.Registry) *tool.Registry {
+// read-only research tools only. MCP tools are opt-in: when allowedMCPTools is
+// empty all MCP tools are excluded; when populated only the listed MCP tools
+// (by model-visible name, e.g. "mcp__github__search_issues") are available.
+// Built-in read-only tools are unaffected.
+func PlannerToolRegistry(parent *tool.Registry, allowedMCPTools ...string) *tool.Registry {
 	exclude := append(SubagentMetaTools(), plannerNonResearchTools...)
-	return FilterReadOnlyRegistry(parent, exclude...)
+	ex := make(map[string]bool, len(exclude))
+	for _, e := range exclude {
+		ex[e] = true
+	}
+	allowed := make(map[string]bool, len(allowedMCPTools))
+	for _, a := range allowedMCPTools {
+		allowed[a] = true
+	}
+	sub := tool.NewRegistry()
+	if parent == nil {
+		return sub
+	}
+	for _, name := range parent.Names() {
+		if ex[name] {
+			continue
+		}
+		isMCP := strings.HasPrefix(name, tool.MCPNamePrefix)
+		// MCP tools are opt-in: all blocked unless explicitly listed.
+		if isMCP && !allowed[name] {
+			continue
+		}
+		tl, ok := parent.Get(name)
+		if !ok {
+			continue
+		}
+		if isMCP && allowed[name] {
+			// Explicitly allowed MCP tools bypass ReadOnly and untrusted checks:
+			// the user intentionally opted in via planner_allowed_tools, so the
+			// planner may use them regardless of the server's readOnlyHint.
+			sub.Add(tl)
+			continue
+		}
+		if !tl.ReadOnly() {
+			continue
+		}
+		if u, ok := tl.(tool.PlanModeUntrustedReadOnly); ok && u.PlanModeUntrustedReadOnly() {
+			continue
+		}
+		sub.Add(tl)
+	}
+	return sub
 }
 
 // ReadOnlySubagentToolRegistry returns the tool set exposed to read-only

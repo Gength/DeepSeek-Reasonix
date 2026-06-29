@@ -57,6 +57,12 @@ type Coordinator struct {
 	// trivial, non-work turn (a question, a greeting) skip straight to the
 	// executor instead of paying a planner round on it.
 	shouldPlan func(string) bool
+	// planMode, when true, makes Run() stop after the planner produces its plan
+	// instead of handing off to the executor. Set from the outside via SetPlanMode.
+	planMode bool
+	// lastExecutorSummary caches the executor's final assistant message from the
+	// previous turn so the planner can see what was actually done on the next run.
+	lastExecutorSummary string
 }
 
 // NewCoordinator wires a planner provider (with its own session) to an executor.
@@ -123,6 +129,25 @@ func (c *Coordinator) ResetPlannerSession() {
 	if c.plannerAgent != nil {
 		c.plannerAgent.SetSession(next)
 	}
+	// Clear the cached executor summary so it does not leak across sessions.
+	c.lastExecutorSummary = ""
+}
+
+// captureExecutorSummary reads the last assistant message from the executor's
+// session after a successful run and caches it in lastExecutorSummary so the
+// planner on the next turn sees what was actually done. Like formatHandoff
+// (planner→executor), the full content is preserved without truncation.
+func (c *Coordinator) captureExecutorSummary() {
+	if c == nil || c.executor == nil || c.executor.session == nil {
+		return
+	}
+	msgs := c.executor.session.Messages
+	for i := len(msgs) - 1; i >= 0; i-- {
+		if msgs[i].Role == provider.RoleAssistant && strings.TrimSpace(msgs[i].Content) != "" {
+			c.lastExecutorSummary = strings.TrimSpace(msgs[i].Content)
+			return
+		}
+	}
 }
 
 // SetReasoningLanguage updates both agents in two-model mode. The raw planner
@@ -161,6 +186,7 @@ func (c *Coordinator) SetPlanMode(v bool) {
 	if c == nil {
 		return
 	}
+	c.planMode = v
 	if c.plannerAgent != nil {
 		c.plannerAgent.SetPlanMode(v)
 	}
@@ -184,24 +210,59 @@ func (c *Coordinator) SetPlanModeReadOnlyTrustGate(g PlanModeReadOnlyTrustGate) 
 }
 
 // Run plans with the planner model, then hands the plan to the executor.
+// When planMode is true the method returns after planning, so the plan text is
+// surfaced without the executor re-doing read-only research.
 func (c *Coordinator) Run(ctx context.Context, input string) error {
 	c.sink.Emit(event.Event{Kind: event.TurnStarted})
+
 	if c.shouldPlan != nil && !c.shouldPlan(input) {
+		// Append the previous executor summary so the executor can continue from
+		// where it left off. For synthetic approval messages (planApprovedMessage)
+		// this is skipped — the summary would break IsSyntheticUserMessage detection
+		// and cause the planner to run instead of the executor.
+		if c.lastExecutorSummary != "" {
+			input = input + "\n\n[Previous execution summary]\n" + c.lastExecutorSummary
+		}
 		c.sink.Emit(event.Event{Kind: event.Phase, Text: c.executor.prov.Name() + " · executing", Source: event.UsageSourceExecutor})
-		return c.executor.Run(ctx, input)
+		err := c.executor.Run(ctx, input)
+		if err == nil {
+			c.captureExecutorSummary()
+		}
+		return err
+	}
+
+	// Append the previous executor summary so the planner knows what was done.
+	if c.lastExecutorSummary != "" {
+		input = input + "\n\n[Previous execution summary]\n" + c.lastExecutorSummary
 	}
 	c.sink.Emit(event.Event{Kind: event.Phase, Text: c.planner.Name() + " · planning", Source: event.UsageSourcePlanner})
 	plan, err := c.plan(ctx, input)
 	if err != nil {
 		return fmt.Errorf("planner: %w", err)
 	}
+
+	// In plan mode, stop after planning — the plan is the output, executor is not invoked.
+	// Also add the plan as an assistant message to the executor's session so the
+	// turn orchestrator's plan-approval flow can extract it via lastAssistantText.
+	if c.planMode {
+		c.sink.Emit(event.Event{Kind: event.Text, Text: plan})
+		if c.executor != nil && c.executor.Session() != nil {
+			c.executor.Session().Add(provider.Message{Role: provider.RoleAssistant, Content: plan})
+		}
+		return nil
+	}
+
 	c.sink.Emit(event.Event{Kind: event.Phase, Text: c.executor.prov.Name() + " · executing", Source: event.UsageSourceExecutor})
 	if isNoOpPlan(plan) {
 		c.persistExecutorNoOp(ctx, input, plan)
 		c.sink.Emit(event.Event{Kind: event.Text, Text: plan})
 		return nil
 	}
-	return c.executor.Run(ctx, formatHandoff(input, plan, executorToolHandoffContext(c.executor)))
+	err = c.executor.Run(ctx, formatHandoff(input, plan, executorToolHandoffContext(c.executor)))
+	if err == nil {
+		c.captureExecutorSummary()
+	}
+	return err
 }
 
 func isNoOpPlan(plan string) bool {

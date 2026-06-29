@@ -6,6 +6,27 @@ branch.
 
 ## Unreleased
 
+### Added
+
+- **Planner MCP tool opt-in**: MCP tools are now opt-in for the planner. When
+  MCP servers are connected, only tools listed in the new `planner_allowed_tools`
+  config are visible to the planner; all other MCP tools are blocked. Built-in
+  read-only tools are unaffected. (`internal/agent/task.go`,
+  `internal/config/config.go`, `internal/config/render.go`,
+  `internal/boot/boot.go`)
+
+- **Planner controls Executor invocation**: In two-model mode, when plan mode is
+  active the Coordinator stops after the planner produces its plan instead of
+  unconditionally running the executor. This avoids wasted tokens from the
+  executor re-doing read-only research. (`internal/agent/coordinator.go`)
+
+- **Executor summary feedback to Planner**: After each executor run, the
+  Coordinator caches the executor's final assistant message and injects it as
+  `[Previous execution summary]` into the planner's input on the next turn. This
+  keeps the planner aware of what was actually done. The cache is cleared on
+  `ResetPlannerSession` to avoid cross-session leakage.
+  (`internal/agent/coordinator.go`)
+
 ### Changed
 
 - Agent runtime defaults now leave both executor and dedicated planner tool-call

@@ -238,6 +238,11 @@ func RenderTOMLForScope(c *Config, scope RenderScope) string {
 	} else {
 		b.WriteString("# plan_mode_allowed_tools = [\"custom_reader\"]   # extra read-only declarations; cannot unlock known blocked tools or unsafe bash\n")
 	}
+	if len(c.Agent.PlannerAllowedTools) > 0 {
+		fmt.Fprintf(&b, "planner_allowed_tools = %s   # MCP tools the planner may use (opt-in; all MCP blocked otherwise)\n", renderStringArray(c.Agent.PlannerAllowedTools))
+	} else {
+		b.WriteString("# planner_allowed_tools = [\"mcp__github__search_issues\"]   # MCP tools the planner may use; empty = no MCP\n")
+	}
 	if c.Agent.PlannerModel != "" {
 		fmt.Fprintf(&b, "planner_model = %q   # low-frequency planner (two-model collaboration)\n", c.Agent.PlannerModel)
 	} else {
@@ -719,6 +724,10 @@ func RenderTOMLProjectDelta(c *Config) string {
 	}
 	if len(c.Agent.PlanModeAllowedTools) > 0 && !reflect.DeepEqual(c.Agent.PlanModeAllowedTools, d.Agent.PlanModeAllowedTools) {
 		fmt.Fprintf(&agentBuf, "plan_mode_allowed_tools = %s\n", renderStringArray(c.Agent.PlanModeAllowedTools))
+		anyAgent = true
+	}
+	if len(c.Agent.PlannerAllowedTools) > 0 && !reflect.DeepEqual(c.Agent.PlannerAllowedTools, d.Agent.PlannerAllowedTools) {
+		fmt.Fprintf(&agentBuf, "planner_allowed_tools = %s\n", renderStringArray(c.Agent.PlannerAllowedTools))
 		anyAgent = true
 	}
 	if c.Agent.PlannerModel != "" && c.Agent.PlannerModel != d.Agent.PlannerModel {
