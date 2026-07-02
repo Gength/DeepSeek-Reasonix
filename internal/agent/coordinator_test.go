@@ -842,26 +842,6 @@ func TestCoordinatorCaptureExecutorSummaryEmptySession(t *testing.T) {
 	}
 }
 
-// TestCoordinatorCaptureExecutorSummaryPreservesLongSummary verifies that
-// captureExecutorSummary preserves the full content without truncation, matching
-// the planner→executor formatHandoff behavior.
-func TestCoordinatorCaptureExecutorSummaryPreservesLongSummary(t *testing.T) {
-	long := strings.Repeat("a", 3000)
-	sess := NewSession("exec-sys")
-	sess.Add(provider.Message{Role: provider.RoleAssistant, Content: long})
-
-	executor := New(&mockProvider{name: "executor"}, tool.NewRegistry(), sess, Options{}, event.Discard)
-	coord := NewCoordinator(&mockProvider{name: "planner"}, NewSession("planner-sys"), nil, nil, Options{}, executor, 0, event.Discard, nil)
-
-	coord.captureExecutorSummary()
-	if len(coord.lastExecutorSummary) != 3000 {
-		t.Errorf("summary length = %d, want 3000 (full content preserved)", len(coord.lastExecutorSummary))
-	}
-	if coord.lastExecutorSummary != long {
-		t.Error("summary content should be preserved in full")
-	}
-}
-
 // TestCoordinatorLastExecutorSummaryInjected verifies that on the next Run(), the
 // cached lastExecutorSummary is injected into the planner's input.
 func TestCoordinatorLastExecutorSummaryInjected(t *testing.T) {

@@ -30,6 +30,7 @@ actionable.`
 
 const executorHandoffMarker = "Reasonix executor handoff"
 
+
 // PlannerPromptWithContext appends cache-stable standing context, such as loaded
 // REASONIX.md / AGENTS.md memory, to the planner's smaller system prompt.
 func PlannerPromptWithContext(context string) string {
@@ -135,8 +136,8 @@ func (c *Coordinator) ResetPlannerSession() {
 
 // captureExecutorSummary reads the last assistant message from the executor's
 // session after a successful run and caches it in lastExecutorSummary so the
-// planner on the next turn sees what was actually done. Like formatHandoff
-// (planner→executor), the full content is preserved without truncation.
+// planner on the next turn sees what was actually done. Full content is
+// preserved — the planner can handle the verbatim reply.
 func (c *Coordinator) captureExecutorSummary() {
 	if c == nil || c.executor == nil || c.executor.session == nil {
 		return
@@ -216,13 +217,11 @@ func (c *Coordinator) Run(ctx context.Context, input string) error {
 	c.sink.Emit(event.Event{Kind: event.TurnStarted})
 
 	if c.shouldPlan != nil && !c.shouldPlan(input) {
-		// Append the previous executor summary so the executor can continue from
-		// where it left off. For synthetic approval messages (planApprovedMessage)
-		// this is skipped — the summary would break IsSyntheticUserMessage detection
-		// and cause the planner to run instead of the executor.
-		if c.lastExecutorSummary != "" {
-			input = input + "\n\n[Previous execution summary]\n" + c.lastExecutorSummary
-		}
+		// Executor-only path: no summary injection here. The executor has its own
+		// session history and does not need the summary re-injected. Skipping it
+		// also avoids breaking IsSyntheticUserMessage detection for synthetic
+		// approval messages (planApprovedMessage) and prevents the summary
+		// accumulation feedback loop described in PR #5566.
 		c.sink.Emit(event.Event{Kind: event.Phase, Text: c.executor.prov.Name() + " · executing", Source: event.UsageSourceExecutor})
 		err := c.executor.Run(ctx, input)
 		if err == nil {
@@ -231,12 +230,16 @@ func (c *Coordinator) Run(ctx context.Context, input string) error {
 		return err
 	}
 
-	// Append the previous executor summary so the planner knows what was done.
+	// Inject the previous executor summary into the planner's input so the
+	// planner knows what was actually done in the previous turn.
+	// We save the original input separately so formatHandoff does not pass the
+	// summary to the executor (its own session already has the full history).
+	planInput := input
 	if c.lastExecutorSummary != "" {
-		input = input + "\n\n[Previous execution summary]\n" + c.lastExecutorSummary
+		planInput = input + "\n\n[Previous execution summary]\n" + c.lastExecutorSummary
 	}
 	c.sink.Emit(event.Event{Kind: event.Phase, Text: c.planner.Name() + " · planning", Source: event.UsageSourcePlanner})
-	plan, err := c.plan(ctx, input)
+	plan, err := c.plan(ctx, planInput)
 	if err != nil {
 		return fmt.Errorf("planner: %w", err)
 	}
@@ -258,6 +261,8 @@ func (c *Coordinator) Run(ctx context.Context, input string) error {
 		c.sink.Emit(event.Event{Kind: event.Text, Text: plan})
 		return nil
 	}
+	// Use the original input (without summary) for formatHandoff — the executor
+	// has its own session and does not need the summary re-injected.
 	err = c.executor.Run(ctx, formatHandoff(input, plan, executorToolHandoffContext(c.executor)))
 	if err == nil {
 		c.captureExecutorSummary()
