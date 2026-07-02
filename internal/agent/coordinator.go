@@ -18,18 +18,32 @@ type Runner interface {
 }
 
 // DefaultPlannerPrompt steers the planner toward concise plans, not execution.
-const DefaultPlannerPrompt = `You are the planner in a two-model coding agent.
-Given a task, produce a concise, ordered plan for the executor model to carry out.
-Use the read-only tools available to you when the task needs context from the
-workspace, user rules, or docs; keep that research targeted and stop once you
-have enough evidence. Do not write full implementations or attempt side effects.
-Do not ask the user how to trigger the executor and do not say you are waiting
-for the executor. Output executor-ready instructions: what to do, which files or
-commands are relevant, expected blockers, and key decisions. Keep it short and
-actionable.`
+const DefaultPlannerPrompt = `You are the planner in a two-model coding agent. Your tools are read-only.
+You CANNOT write files, run commands, or make any changes. The executor handles
+all of that. Do not attempt side effects — they will fail.
+
+When you receive a user request, you MUST decompose it before acting:
+1. Identify the Planner part: what context do you need to research? Which files
+   must be read to understand the task? What rules, docs, or past execution
+   results (ExecutionSummary.md) are relevant?
+2. Identify the Executor part: what code must be written, which commands must
+   run, which files must change? This is NOT your job.
+3. Execute ONLY the Planner part — use your read-only tools for research.
+   Stop as soon as you have enough evidence to plan. Never try to write, edit,
+   delete, or run anything.
+4. Produce a concise, ordered plan that tells the executor how to carry out
+   the Executor part. Output executor-ready instructions: what to do, which files
+   or commands are relevant, expected blockers, and key decisions.
+
+Other rules:
+- Before producing any plan, read ExecutionSummary.md (at the project root) to
+  learn what the executor has already done. If it does not exist, assume a fresh
+  start.
+- Do not ask the user how to trigger the executor and do not say you are waiting
+  for the executor.
+- Keep the plan short and actionable.`
 
 const executorHandoffMarker = "Reasonix executor handoff"
-
 
 // PlannerPromptWithContext appends cache-stable standing context, such as loaded
 // REASONIX.md / AGENTS.md memory, to the planner's smaller system prompt.
@@ -61,9 +75,6 @@ type Coordinator struct {
 	// planMode, when true, makes Run() stop after the planner produces its plan
 	// instead of handing off to the executor. Set from the outside via SetPlanMode.
 	planMode bool
-	// lastExecutorSummary caches the executor's final assistant message from the
-	// previous turn so the planner can see what was actually done on the next run.
-	lastExecutorSummary string
 }
 
 // NewCoordinator wires a planner provider (with its own session) to an executor.
@@ -129,25 +140,6 @@ func (c *Coordinator) ResetPlannerSession() {
 	c.plannerSess = next
 	if c.plannerAgent != nil {
 		c.plannerAgent.SetSession(next)
-	}
-	// Clear the cached executor summary so it does not leak across sessions.
-	c.lastExecutorSummary = ""
-}
-
-// captureExecutorSummary reads the last assistant message from the executor's
-// session after a successful run and caches it in lastExecutorSummary so the
-// planner on the next turn sees what was actually done. Full content is
-// preserved — the planner can handle the verbatim reply.
-func (c *Coordinator) captureExecutorSummary() {
-	if c == nil || c.executor == nil || c.executor.session == nil {
-		return
-	}
-	msgs := c.executor.session.Messages
-	for i := len(msgs) - 1; i >= 0; i-- {
-		if msgs[i].Role == provider.RoleAssistant && strings.TrimSpace(msgs[i].Content) != "" {
-			c.lastExecutorSummary = strings.TrimSpace(msgs[i].Content)
-			return
-		}
 	}
 }
 
@@ -217,29 +209,13 @@ func (c *Coordinator) Run(ctx context.Context, input string) error {
 	c.sink.Emit(event.Event{Kind: event.TurnStarted})
 
 	if c.shouldPlan != nil && !c.shouldPlan(input) {
-		// Executor-only path: no summary injection here. The executor has its own
-		// session history and does not need the summary re-injected. Skipping it
-		// also avoids breaking IsSyntheticUserMessage detection for synthetic
-		// approval messages (planApprovedMessage) and prevents the summary
-		// accumulation feedback loop described in PR #5566.
 		c.sink.Emit(event.Event{Kind: event.Phase, Text: c.executor.prov.Name() + " · executing", Source: event.UsageSourceExecutor})
 		err := c.executor.Run(ctx, input)
-		if err == nil {
-			c.captureExecutorSummary()
-		}
 		return err
 	}
 
-	// Inject the previous executor summary into the planner's input so the
-	// planner knows what was actually done in the previous turn.
-	// We save the original input separately so formatHandoff does not pass the
-	// summary to the executor (its own session already has the full history).
-	planInput := input
-	if c.lastExecutorSummary != "" {
-		planInput = input + "\n\n[Previous execution summary]\n" + c.lastExecutorSummary
-	}
 	c.sink.Emit(event.Event{Kind: event.Phase, Text: c.planner.Name() + " · planning", Source: event.UsageSourcePlanner})
-	plan, err := c.plan(ctx, planInput)
+	plan, err := c.plan(ctx, input)
 	if err != nil {
 		return fmt.Errorf("planner: %w", err)
 	}
@@ -261,12 +237,7 @@ func (c *Coordinator) Run(ctx context.Context, input string) error {
 		c.sink.Emit(event.Event{Kind: event.Text, Text: plan})
 		return nil
 	}
-	// Use the original input (without summary) for formatHandoff — the executor
-	// has its own session and does not need the summary re-injected.
 	err = c.executor.Run(ctx, formatHandoff(input, plan, executorToolHandoffContext(c.executor)))
-	if err == nil {
-		c.captureExecutorSummary()
-	}
 	return err
 }
 
@@ -438,6 +409,7 @@ Executor instructions:
 - If the task requires changes, call the appropriate tools (for example write/edit/bash) instead of only restating the plan.
 - If a target path is outside the writable workspace or otherwise blocked, explain that specific blocker and ask for the needed path/approval.
 - **Serial workflow**: establish the task list with one todo_write (first sub-task in_progress), then for EACH sub-task execute it and call complete_step with evidence. The host advances the list for you — it marks the sub-task completed and moves the next to in_progress, so you don't need another todo_write to mark completions. Sign off one sub-task at a time; never batch completions.
+- **ExecutionSummary.md**: After every complete turn, append a dated summary block to the project root file ExecutionSummary.md. Include timestamp (ISO 8601), what was done, files changed, errors/blockers, and state for the planner. If the planner has read the previous entry (indicated by the planner mentioning it), overwrite; otherwise append. This is the only channel between executor and planner — the planner reads it before every plan.
 
 Carry out the task, adapting the plan as needed.`, executorHandoffMarker, task, plan, toolBlock)
 }

@@ -20,12 +20,21 @@ branch.
   unconditionally running the executor. This avoids wasted tokens from the
   executor re-doing read-only research. (`internal/agent/coordinator.go`)
 
-- **Executor summary feedback to Planner**: After each executor run, the
-  Coordinator caches the executor's final assistant message and injects it as
-  `[Previous execution summary]` into the planner's input on the next turn. This
-  keeps the planner aware of what was actually done. The cache is cleared on
-  `ResetPlannerSession` to avoid cross-session leakage.
-  (`internal/agent/coordinator.go`)
+- **ExecutionSummary.md protocol replaces executor-summary injection**: The
+  Planner–Executor communication channel is now a durable file at the project
+  root. After each turn, the executor writes a dated summary block
+  (timestamp, task completed, key outcomes, files changed, errors & blockers,
+  state for planner). The planner reads `ExecutionSummary.md` before producing
+  every plan. The old in-memory `lastExecutorSummary` injection mechanism is
+  removed. (`internal/agent/coordinator.go`)
+
+- **Planner decomposition of requests**: The planner prompt now enforces
+  explicit request decomposition before any tool use: (1) identify the
+  Planner part (research), (2) identify the Executor part (code/commands),
+  (3) execute only the Planner part with read-only tools, (4) produce an
+  executor-ready plan. This prevents the planner from attempting side-effect
+  tools, failing, and recovering — saving tokens. (`internal/agent/coordinator.go`)
+
 
 ### Changed
 
