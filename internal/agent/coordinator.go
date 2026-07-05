@@ -39,9 +39,16 @@ Other rules:
 - Before producing any plan, read ExecutionSummary.md (at the project root) to
   learn what the executor has already done. If it does not exist, assume a fresh
   start.
+- After reading ExecutionSummary.md, if you see a previous entry with a unique
+  identifier (e.g. "[id:abc123]"), your plan's step 1 MUST be written as:
+  "Clean up ExecutionSummary entry [id:abc123]". If there are multiple old
+  entries, clean up the oldest one(s) — keep at most the last 2-3 entries.
+  If there is no previous entry to clean up, omit step 1.
+- Your plan's LAST step MUST be: "Append execution summary in ExecutionSummary.md".
 - Do not ask the user how to trigger the executor and do not say you are waiting
   for the executor.
-- Keep the plan short and actionable.`
+- Keep the plan short and actionable — write it as an ordered list of numbered
+  steps (step 1 = cleanup if applicable, middle = task steps, last = append summary).`
 
 const executorHandoffMarker = "Reasonix executor handoff"
 
@@ -409,7 +416,14 @@ Executor instructions:
 - If the task requires changes, call the appropriate tools (for example write/edit/bash) instead of only restating the plan.
 - If a target path is outside the writable workspace or otherwise blocked, explain that specific blocker and ask for the needed path/approval.
 - **Serial workflow**: establish the task list with one todo_write (first sub-task in_progress), then for EACH sub-task execute it and call complete_step with evidence. The host advances the list for you — it marks the sub-task completed and moves the next to in_progress, so you don't need another todo_write to mark completions. Sign off one sub-task at a time; never batch completions.
-- **ExecutionSummary.md**: After every complete turn, append a dated summary block to the project root file ExecutionSummary.md. Before writing, run 'date -u +%%Y-%%m-%%dT%%H:%%M:%%SZ' (or the platform equivalent, e.g. 'date /t' + 'time /t' on Windows) to capture the real system time — never invent the timestamp. Include that timestamp (ISO 8601), what was done, files changed, errors/blockers, and state for the planner. If the planner has read the previous entry (indicated by the planner mentioning it), overwrite; otherwise append. This is the only channel between executor and planner — the planner reads it before every plan.
+- **ExecutionSummary.md — writing entries with a unique ID**: After every
+  complete turn, append a dated summary block to the project root file
+  ExecutionSummary.md. Before writing, run 'date -u +%%Y-%%m-%%dT%%H:%%M:%%SZ'
+  (or the platform equivalent) to capture the real system time. Generate a short unique identifier for each entry. Format the
+  header as '## <timestamp> [id:<uid>]'. Always append — never overwrite. The
+  planner will handle cleaning up stale entries via cleanup TODOs. Include the
+  timestamp (ISO 8601), what was done, files changed, errors/blockers, and state
+  for the planner.
 
 Carry out the task, adapting the plan as needed.`, executorHandoffMarker, task, plan, toolBlock)
 }

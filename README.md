@@ -41,8 +41,8 @@
 
 <br/>
 
-<h3 align="center">A DeepSeek-native AI coding agent for your terminal.</h3>
-<p align="center">A config- and plugin-driven harness — a single static Go binary, tuned around DeepSeek's prefix cache so token costs stay low across long sessions.</p>
+<h3 align="center">A DeepSeek-native AI coding agent for your terminal, powered by a two-model Planner-Executor architecture.</h3>
+<p align="center">Built around planner-executor collaboration, prefix-cache efficiency, and config-driven extensibility — delivered as a single static Go binary.</p>
 
 <br/>
 
@@ -53,16 +53,39 @@
 
 ## Features
 
+### Planner-Executor architecture
+
+- **Two-model collaboration.** The planner — a lightweight, read-only model —
+  decomposes every request before acting: (1) identify the Planner part
+  (research), (2) identify the Executor part (code / commands), (3) execute
+  only the Planner part with read-only tools, (4) produce a structured,
+  executor-ready plan. The executor then carries it out with full tool access.
+  Each model runs in its own cache-stable session, so neither's prefix cache
+  is disturbed by the other's turns.
+- **ExecutionSummary.md protocol.** The planner and executor communicate through
+  a durable file at the project root. After every turn, the executor appends a
+  dated summary block (timestamp, what was done, files changed, blockers,
+  state for the planner). The planner reads this file before producing every
+  plan — no more in-memory injection, no lost context.
+- **Plan mode.** When enabled, the Coordinator stops after the planner produces
+  its plan instead of unconditionally invoking the executor. This avoids wasted
+  tokens from the executor re-doing read-only research the planner already
+  performed.
+- **Planner MCP tool opt-in.** MCP servers are connected, but only tools listed
+  in the `planner_allowed_tools` config are visible to the planner. All other
+  MCP tools are blocked. Built-in read-only tools (grep, read_file, glob, etc.)
+  are always available.
+
+### Foundation
+
 - **Config-driven.** Providers, the agent, enabled tools, and plugins are all
-  declared in `reasonix.toml`. No hardcoded models.
-- **Multi-model & composable.** DeepSeek ships as a preset; any
-  OpenAI-compatible endpoint is a config entry, not new code. Optionally run
-  two models together (executor + planner) in separate, cache-stable sessions.
+  declared in `reasonix.toml`. Any OpenAI-compatible endpoint is a config entry,
+  not new code.
 - **Plugin-driven.** External tools run as subprocesses over stdio JSON-RPC
   (MCP-compatible). Built-in tools self-register at compile time.
-- **Cache-aware context maintenance.** Startup injects a small stable environment
-  summary, stale tool output is snipped/pruned before summary compaction, and the
-  built-in tool schema contract is documented for regression review.
+- **Cache-aware.** Startup injects a small stable environment summary, stale
+  tool output is pruned before compaction, and the built-in tool schema
+  contract is documented for regression review.
 - **Zero-friction distribution.** `CGO_ENABLED=0` single binary; cross-compile
   to six targets with one command. The only dependency is a TOML parser.
 
@@ -145,65 +168,3 @@ commands, `@` references, and two-model setup are all in the
   safety net (Esc-Esc / `/rewind`).
 
 <br/>
-
-## Star History
-
-<a href="https://www.star-history.com/?repos=esengine%2FDeepSeek-Reasonix&type=date&legend=top-left">
- <picture>
-   <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/chart?repos=esengine/DeepSeek-Reasonix&type=date&theme=dark&legend=top-left" />
-   <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/chart?repos=esengine/DeepSeek-Reasonix&type=date&legend=top-left" />
-   <img alt="Star History Chart" src="https://api.star-history.com/chart?repos=esengine/DeepSeek-Reasonix&type=date&legend=top-left" />
- </picture>
-</a>
-
-<br/>
-
-## Support
-
-If Reasonix has been useful and you'd like to say thanks, you can. It stays a coffee, not a contract — donations don't buy feature priority or change how issues get triaged.
-
-- **International** — PayPal: [paypal.me/yuhuahui](https://paypal.me/yuhuahui)
-- **国内** — 微信支付（扫码）
-
-<p align="center">
-  <img src=".github/sponsor/wechat-pay.jpg" alt="WeChat Pay QR code" width="240"/>
-</p>
-
-<br/>
-
-## Acknowledgments
-
-A small list of folks whose work has shaped Reasonix the most — measured
-by both commit count and code volume. **Listed alphabetically, no ordering
-of importance.** The full contributor graph is on
-[GitHub](https://github.com/esengine/DeepSeek-Reasonix/graphs/contributors).
-
-- [**ctharvey**](https://github.com/ctharvey)
-- [**dimasd-angga**](https://github.com/dimasd-angga) (Dimas D. Angga)
-- [**Evan-Pycraft**](https://github.com/Evan-Pycraft)
-- [**ForeverYoungPp**](https://github.com/ForeverYoungPp)
-- [**GTC2080**](https://github.com/GTC2080) (TaoMu)
-- [**kabaka9527**](https://github.com/kabaka9527)
-- [**lisniuse**](https://github.com/lisniuse) (Richie)
-- [**wade19990814-hue**](https://github.com/wade19990814-hue)
-- [**wviana**](https://github.com/wviana) (Wesley Viana)
-
-Also a separate thank-you to [**Bernardxu123**](https://github.com/Bernardxu123)
-for designing the project logo, and to
-[AIGC Link](https://xhslink.com/m/80ngts127cA) for promoting the project on XiaoHongShu.
-
-<p align="center">
-  <a href="https://github.com/esengine/DeepSeek-Reasonix/graphs/contributors">
-    <img src="https://contrib.rocks/image?repo=esengine/DeepSeek-Reasonix&max=100&columns=12" alt="Contributors to esengine/DeepSeek-Reasonix" width="860"/>
-  </a>
-</p>
-
-<br/>
-
----
-
-<p align="center">
-  <sub>MIT — see <a href="./LICENSE">LICENSE</a></sub>
-  <br/>
-  <sub>Built by the community at <a href="https://github.com/esengine/DeepSeek-Reasonix/graphs/contributors">esengine/DeepSeek-Reasonix</a></sub>
-</p>

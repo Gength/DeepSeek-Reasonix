@@ -4,38 +4,6 @@ All notable changes to the Go line (Reasonix 1.0+) are recorded here. The legacy
 `0.x` TypeScript history lives on the [`v1`](https://github.com/esengine/DeepSeek-Reasonix/tree/v1)
 branch.
 
-## Unreleased
-
-### Added
-
-- **Planner MCP tool opt-in**: MCP tools are now opt-in for the planner. When
-  MCP servers are connected, only tools listed in the new `planner_allowed_tools`
-  config are visible to the planner; all other MCP tools are blocked. Built-in
-  read-only tools are unaffected. (`internal/agent/task.go`,
-  `internal/config/config.go`, `internal/config/render.go`,
-  `internal/boot/boot.go`)
-
-- **Planner controls Executor invocation**: In two-model mode, when plan mode is
-  active the Coordinator stops after the planner produces its plan instead of
-  unconditionally running the executor. This avoids wasted tokens from the
-  executor re-doing read-only research. (`internal/agent/coordinator.go`)
-
-- **ExecutionSummary.md protocol replaces executor-summary injection**: The
-  Planner–Executor communication channel is now a durable file at the project
-  root. After each turn, the executor writes a dated summary block
-  (timestamp, task completed, key outcomes, files changed, errors & blockers,
-  state for planner). The planner reads `ExecutionSummary.md` before producing
-  every plan. The old in-memory `lastExecutorSummary` injection mechanism is
-  removed. (`internal/agent/coordinator.go`)
-
-- **Planner decomposition of requests**: The planner prompt now enforces
-  explicit request decomposition before any tool use: (1) identify the
-  Planner part (research), (2) identify the Executor part (code/commands),
-  (3) execute only the Planner part with read-only tools, (4) produce an
-  executor-ready plan. This prevents the planner from attempting side-effect
-  tools, failing, and recovering — saving tokens. (`internal/agent/coordinator.go`)
-
-
 ### Changed
 
 - Agent runtime defaults now leave both executor and dedicated planner tool-call
