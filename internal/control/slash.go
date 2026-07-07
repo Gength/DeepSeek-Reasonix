@@ -10,7 +10,9 @@ import (
 	"reasonix/internal/config"
 	"reasonix/internal/hook"
 	"reasonix/internal/i18n"
+	"reasonix/internal/memorycompiler"
 	"reasonix/internal/migration"
+	"reasonix/internal/pluginpkg"
 	"reasonix/internal/skill"
 )
 
@@ -39,13 +41,14 @@ type ArgData struct {
 	CurrentModel    string
 	ProviderNames   []string
 	CurrentProvider string
+	PluginNames     []string
 }
 
 // SlashArgItems completes the arguments of a management slash command
 // (everything after the command word). It returns the suggestions filtered by
 // the token being typed and the byte offset where that token begins, so a caller
 // replaces just that token. Only structured commands participate (/mcp /model
-// /skills /hooks /effort /auto-plan /goal /reasoning-language /memory-v5
+// /skills /plugins /hooks /effort /auto-plan /goal /reasoning-language /memory-v5
 // /theme /language);
 // others yield nil. Single source of truth for CLI + desktop.
 func SlashArgItems(line string, d ArgData) ([]SlashItem, int) {
@@ -66,6 +69,8 @@ func SlashArgItems(line string, d ArgData) ([]SlashItem, int) {
 		raw = providerArgItems(prior, d)
 	case "/skill", "/skills":
 		raw = skillArgItems(prior, d)
+	case "/plugin", "/plugins":
+		raw = pluginArgItems(prior, d)
 	case "/hooks":
 		raw = hooksArgItems(prior)
 	case "/effort":
@@ -127,6 +132,7 @@ func memoryV5ArgItems(prior []string) []SlashItem {
 	}
 	return []SlashItem{
 		{Label: "status", Insert: "status", Hint: "show current Memory v5 state"},
+		{Label: "learnings", Insert: "learnings", Hint: "show learned strategies and patterns"},
 		{Label: "off", Insert: "off", Hint: "disable Memory v5 for future turns"},
 		{Label: "observe", Insert: "observe", Hint: "learn without injecting IR"},
 		{Label: "compact", Insert: "compact", Hint: "inject compact execution contracts"},
@@ -344,6 +350,22 @@ func skillArgItems(prior []string, d ArgData) []SlashItem {
 	return nil
 }
 
+func pluginArgItems(prior []string, d ArgData) []SlashItem {
+	if len(prior) <= 1 {
+		return []SlashItem{
+			{Label: "show", Insert: "show ", Hint: "show plugin capabilities and usage", Descend: true},
+		}
+	}
+	if (prior[1] == "show" || prior[1] == "cat") && len(prior) == 2 {
+		var items []SlashItem
+		for _, name := range d.PluginNames {
+			items = append(items, SlashItem{Label: name, Insert: name})
+		}
+		return items
+	}
+	return nil
+}
+
 func hooksArgItems(prior []string) []SlashItem {
 	if len(prior) <= 1 {
 		return []SlashItem{
@@ -418,6 +440,33 @@ func (c *Controller) managementNotice(trimmed string) bool {
 			return true
 		}
 		c.notice(c.skillListText())
+	case "/plugin", "/plugins":
+		sub := ""
+		if len(fields) >= 2 {
+			sub = strings.ToLower(fields[1])
+		}
+		switch sub {
+		case "", "list", "ls":
+			text, err := pluginpkg.InstalledListText(config.ReasonixHomeDir())
+			if err != nil {
+				c.notice("plugins: " + err.Error())
+			} else {
+				c.notice(text)
+			}
+		case "show", "cat":
+			if len(fields) < 3 {
+				c.notice("usage: /plugins show <name>")
+				return true
+			}
+			text, err := pluginpkg.InstalledShowText(config.ReasonixHomeDir(), fields[2])
+			if err != nil {
+				c.notice("plugins: " + err.Error())
+			} else {
+				c.notice(text)
+			}
+		default:
+			c.notice("unknown /plugins subcommand " + fields[1] + " - try: /plugins or /plugins show <name>")
+		}
 	case "/reload-cmd":
 		if c.Running() {
 			c.notice("wait for the current turn to finish, then retry /reload-cmd")
@@ -468,7 +517,11 @@ func (c *Controller) managementNotice(trimmed string) bool {
 
 func (c *Controller) memoryV5Notice(fields []string) {
 	if len(fields) > 2 {
-		c.notice("usage: /memory-v5 off|observe|compact|on|status")
+		c.notice("usage: /memory-v5 off|observe|compact|on|status|learnings")
+		return
+	}
+	if len(fields) == 2 && strings.EqualFold(fields[1], "learnings") {
+		c.notice(c.memoryV5LearningsText())
 		return
 	}
 	if len(fields) < 2 || strings.EqualFold(fields[1], "status") {
@@ -477,7 +530,7 @@ func (c *Controller) memoryV5Notice(fields []string) {
 			c.notice("memory-v5: " + err.Error())
 			return
 		}
-		c.notice(fmt.Sprintf("memory-v5: %s (usage: /memory-v5 off|observe|compact|on|status)", memoryV5Mode(cfg.MemoryCompilerEnabled(), cfg.MemoryCompilerVerbosity())))
+		c.notice(fmt.Sprintf("memory-v5: %s (usage: /memory-v5 off|observe|compact|on|status|learnings)", memoryV5Mode(cfg.MemoryCompilerEnabled(), cfg.MemoryCompilerVerbosity())))
 		return
 	}
 	if c.Running() {
@@ -494,18 +547,26 @@ func (c *Controller) memoryV5Notice(fields []string) {
 		c.notice("memory-v5: cannot resolve config path")
 		return
 	}
-	edit := config.LoadForEdit(path)
-	if err := edit.SetMemoryCompilerEnabled(setting.enabled); err != nil {
-		c.notice("memory-v5: " + err.Error())
-		return
-	}
-	if setting.setVerbosity {
-		if err := edit.SetMemoryCompilerVerbosity(setting.verbosity); err != nil {
-			c.notice("memory-v5: " + err.Error())
-			return
+	// Lock only the load-modify-save cycle; the controller updates below run
+	// off-lock.
+	edit, err := func() (*config.Config, error) {
+		unlock := config.LockUserConfigEdits()
+		defer unlock()
+		edit := config.LoadForEdit(path)
+		if err := edit.SetMemoryCompilerEnabled(setting.enabled); err != nil {
+			return nil, err
 		}
-	}
-	if err := edit.SaveTo(path); err != nil {
+		if setting.setVerbosity {
+			if err := edit.SetMemoryCompilerVerbosity(setting.verbosity); err != nil {
+				return nil, err
+			}
+		}
+		if err := edit.SaveTo(path); err != nil {
+			return nil, err
+		}
+		return edit, nil
+	}()
+	if err != nil {
 		c.notice("memory-v5: " + err.Error())
 		return
 	}
@@ -531,8 +592,22 @@ func parseMemoryV5Setting(mode string) (memoryV5Setting, error) {
 	case "on", "compact", "inject", "contract":
 		return memoryV5Setting{enabled: true, verbosity: config.MemoryCompilerVerbosityCompact, setVerbosity: true}, nil
 	default:
-		return memoryV5Setting{}, fmt.Errorf("memory-v5 %q: must be off|observe|compact|on|status", mode)
+		return memoryV5Setting{}, fmt.Errorf("memory-v5 %q: must be off|observe|compact|on|status|learnings", mode)
 	}
+}
+
+// memoryV5LearningsText renders the project's learned Memory v5 state. It is a
+// read-only local view; nothing here reaches a provider.
+func (c *Controller) memoryV5LearningsText() string {
+	rt := memorycompiler.New(config.MemoryCompilerDir(c.workspaceRoot))
+	if rt == nil {
+		return "memory-v5: no project state directory"
+	}
+	rep, ok := rt.LearningsReport(0)
+	if !ok {
+		return "memory-v5: no learned state yet"
+	}
+	return memorycompiler.FormatLearningsReport(rep)
 }
 
 func memoryV5Mode(enabled bool, verbosity string) string {

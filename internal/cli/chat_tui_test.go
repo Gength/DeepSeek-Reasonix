@@ -1368,7 +1368,7 @@ func TestAutoPlanCommandPersistsAndUpdatesController(t *testing.T) {
 	input := "实现 GitHub issue #2395：\n- 新增配置项\n- 自动判断复杂任务\n- 补测试和文档"
 	ctrl.Send(input)
 	waitForCLIEvent(t, events, event.TurnDone)
-	if len(runner.inputs) != 1 || !strings.HasPrefix(runner.inputs[0], control.PlanModeMarker) {
+	if len(runner.inputs) != 1 || !strings.HasPrefix(agent.StripTransientUserBlocks(runner.inputs[0]), control.PlanModeMarker) {
 		t.Fatalf("/auto-plan on should affect current controller, inputs=%q", runner.inputs)
 	}
 }
@@ -1417,7 +1417,7 @@ func TestReasoningLanguageCommandPersistsAndUpdatesController(t *testing.T) {
 		t.Fatalf("saved config missing reasoning_language=zh:\n%s", body)
 	}
 	composed := ctrl.Compose("hello")
-	if !strings.HasPrefix(composed, "<reasoning-language>") || !strings.Contains(composed, "Simplified Chinese") {
+	if !strings.HasPrefix(composed, "<reasoning-language>") || !strings.Contains(composed, "简体中文") {
 		t.Fatalf("/reasoning-language zh should affect current controller, got %q", composed)
 	}
 }
@@ -2046,6 +2046,34 @@ func TestSessionSwitchSuppressesOneClearScreen(t *testing.T) {
 	}
 }
 
+func TestWideInputChangeRequestsClearScreen(t *testing.T) {
+	prev := clearWideInputChanges
+	clearWideInputChanges = true
+	defer func() { clearWideInputChanges = prev }()
+
+	m := newTestChatTUI()
+	m.input.SetValue("天安a")
+	m.input.SetCursorColumn(len([]rune("天安a")))
+
+	next, cmd := m.update(tea.KeyPressMsg{Code: '门', Text: "门"})
+	got := next.(chatTUI)
+	if got.input.Value() != "天安a门" {
+		t.Fatalf("wide-char insert should preserve the textarea value, got %q", got.input.Value())
+	}
+	if cmd == nil {
+		t.Fatal("wide-char input changes should request a full redraw")
+	}
+	if shouldClearWideInputChange("ascii", "ascii!") {
+		t.Fatal("single-width ASCII input should not request the wide-input redraw")
+	}
+	if !shouldClearWideInputChange("门", "") {
+		t.Fatal("removing the last wide character should request a full redraw")
+	}
+	if !shouldClearWideInputChange("a门", "a") {
+		t.Fatal("removing a wide character from mixed input should request a full redraw")
+	}
+}
+
 func TestReplayActiveBranchClearsPlanModeAndMarksSessionSwitch(t *testing.T) {
 	m := newTestChatTUI()
 	m.ctrl = control.New(control.Options{})
@@ -2249,6 +2277,56 @@ func TestPasteFoldExpandOnSubmit(t *testing.T) {
 	}
 }
 
+func TestSlashCodeCommentSubmitStartsTurn(t *testing.T) {
+	for _, input := range []string{
+		"// explain this",
+		"/**\n * 阿明\n */",
+	} {
+		t.Run(input, func(t *testing.T) {
+			r := &recordingTurnRunner{}
+			events := make(chan event.Event, 8)
+			ctrl := control.New(control.Options{
+				AutoPlan: "off",
+				Runner:   r,
+				Sink:     event.FuncSink(func(e event.Event) { events <- e }),
+			})
+			m := newTestChatTUI()
+			m.ctrl = ctrl
+			m.input.SetValue(input)
+
+			model, _ := m.Update(tea.KeyPressMsg{Code: tea.KeyEnter})
+			m = model.(chatTUI)
+			waitForCLIEvent(t, events, event.TurnDone)
+
+			if len(r.inputs) != 1 || r.inputs[0] != input {
+				t.Fatalf("slash code comment should start a model turn, inputs=%q", r.inputs)
+			}
+		})
+	}
+}
+
+func TestUnknownSlashCommandDoesNotStartTurn(t *testing.T) {
+	r := &recordingTurnRunner{}
+	ctrl := control.New(control.Options{
+		AutoPlan: "off",
+		Runner:   r,
+		Sink:     event.FuncSink(func(event.Event) {}),
+	})
+	m := newTestChatTUI()
+	m.ctrl = ctrl
+	m.input.SetValue("/definitely-not-a-command")
+
+	model, _ := m.Update(tea.KeyPressMsg{Code: tea.KeyEnter})
+	m = model.(chatTUI)
+
+	if len(r.inputs) != 0 {
+		t.Fatalf("unknown slash command should not start a model turn, inputs=%q", r.inputs)
+	}
+	if got := strings.Join(m.transcript, "\n"); !strings.Contains(got, "unknown command") {
+		t.Fatalf("unknown slash command should be reported in transcript, got:\n%s", got)
+	}
+}
+
 func TestPasteMsgFoldsBeforeTextareaConsumesNewlines(t *testing.T) {
 	m := newTestChatTUI()
 	model, _ := m.Update(tea.PasteMsg{Content: "1\n2\n3\n4\n5"})
@@ -2298,6 +2376,64 @@ func TestApprovalToolDetailsShortensMCPNames(t *testing.T) {
 	name, detail = approvalToolDetails("bash")
 	if name != "bash" || !strings.Contains(detail, "built-in") {
 		t.Errorf("built-in details = (%q, %q), want bash + built-in source", name, detail)
+	}
+}
+
+func TestSandboxEscapeApprovalBannerUsesRealEnvironmentChoice(t *testing.T) {
+	i18n.DetectLanguage("zh")
+	t.Cleanup(func() { i18n.DetectLanguage("en") })
+
+	m := newTestChatTUI()
+	m.width = 120
+	m.pendingApproval = &event.Approval{
+		ID:      "approval-1",
+		Tool:    control.SandboxEscapeApprovalTool,
+		Subject: "仅本次不进沙箱运行：go test ./...",
+		Reason:  "Windows 沙箱启动这条命令时失败。",
+	}
+	banner := m.renderApprovalBanner()
+	if !strings.Contains(banner, "本会话使用真实环境") {
+		t.Fatalf("approval banner = %q, want real-environment session choice", banner)
+	}
+	if !strings.Contains(banner, "允许一次") {
+		t.Fatalf("approval banner = %q, want desktop-matching allow-once choice", banner)
+	}
+	if !strings.Contains(banner, "3. 拒绝") || strings.Contains(banner, "4. 拒绝") {
+		t.Fatalf("approval banner = %q, want conventional 1/2/3 sandbox choices", banner)
+	}
+	if strings.Contains(banner, "sandbox_escape") {
+		t.Fatalf("approval banner leaked raw tool grant: %q", banner)
+	}
+}
+
+func TestFreshApprovalBannerUsesConventionalDenyChoice(t *testing.T) {
+	i18n.DetectLanguage("zh")
+	t.Cleanup(func() { i18n.DetectLanguage("en") })
+
+	m := newTestChatTUI()
+	m.width = 120
+	m.pendingApproval = &event.Approval{
+		ID:      "approval-1",
+		Tool:    "remember",
+		Subject: "保存/更新记忆",
+	}
+	banner := m.renderApprovalBanner()
+	if !strings.Contains(banner, "1. 本次允许") || !strings.Contains(banner, "2. 拒绝") {
+		t.Fatalf("approval banner = %q, want conventional 1/2 fresh choices", banner)
+	}
+	if strings.Contains(banner, "4. 拒绝") {
+		t.Fatalf("approval banner = %q, must not show non-consecutive deny choice", banner)
+	}
+}
+
+func TestFreshApprovalSessionChoiceIsLimitedToSandboxEscape(t *testing.T) {
+	if !freshApprovalAllowsSession(control.SandboxEscapeApprovalTool) {
+		t.Fatal("sandbox escape should allow an explicit session choice")
+	}
+	for _, toolName := range []string{"remember", "forget", planApprovalTool, agent.PlanModeReadOnlyCommandApprovalTool} {
+		if freshApprovalAllowsSession(toolName) {
+			t.Fatalf("%s should not allow the sandbox escape session choice", toolName)
+		}
 	}
 }
 

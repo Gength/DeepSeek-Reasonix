@@ -35,12 +35,13 @@ import {
   X,
 } from "lucide-react";
 import { useToast } from "./lib/toast";
+import { useWailsResizeFix } from "./lib/useWailsResizeFix";
 import { asArray } from "./lib/array";
 import { clearLegacyLangPref, normalizeLangPref, readLegacyLangPref, useI18n, useT, type Translator } from "./lib/i18n";
 import { useController, type Item, type LiveStream } from "./lib/useController";
-import { app, onEvent, onProjectTreeChanged } from "./lib/bridge";
+import { app, onEvent, onProjectTreeChanged, onReady, onRuntimeRebuilt, onSessionRecovered } from "./lib/bridge";
 import { generativeMusic, isGenerativeMusicEnabled } from "./lib/generative-music";
-import { playSuccessChime } from "./lib/sound";
+import { clearAttentionChimeKeys, playAttentionChime, playSuccessChime, shouldPlayAttentionChimeForEvent } from "./lib/sound";
 import { Transcript } from "./components/Transcript";
 import { Composer } from "./components/Composer";
 import { TodoPanel } from "./components/TodoPanel";
@@ -1009,6 +1010,7 @@ export default function App() {
   const setRightDockPreviewWidth = useLayoutStore((s) => s.setRightDockPreviewWidth);
   const workspacePreviewActive = useLayoutStore((s) => s.workspacePreviewActive);
   const setWorkspacePreviewActive = useLayoutStore((s) => s.setWorkspacePreviewActive);
+  const attentionChimeEvents = useRef(new Set<string>());
   // Bump dockRefreshKey after each turn so WorkspacePanel/ContextPanel re-fetch
   // workspace changes, git history, and session metadata after AI tool writes.
   useEffect(() => {
@@ -1016,11 +1018,31 @@ export default function App() {
       if (e.kind === "turn_done") {
         setDockRefreshKey((v) => v + 1);
       }
+      if (shouldPlayAttentionChimeForEvent(e, attentionChimeEvents.current)) {
+        playAttentionChime();
+      }
       if (e.kind === "turn_done") {
         if (!e.err) playSuccessChime();
       }
     });
-    return unsub;
+    // Runtime rebuilds (model/effort/settings switch) replace the controller,
+    // whose approval/ask ids restart from "1" — stale dedupe keys would mute
+    // the first prompt after a rebuild. agent:ready fires when a (re)build
+    // completes; clear that tab's keys (or all, for tab-less ready events).
+    const unsubReady = onReady((readyTabId) => {
+      clearAttentionChimeKeys(attentionChimeEvents.current, readyTabId);
+    });
+    // Model/effort/token-mode switches and clear-while-running replace the
+    // controller WITHOUT an agent:ready — they signal runtime:rebuilt instead
+    // (a ready here would trigger a full session reload the UI already did).
+    const unsubRebuilt = onRuntimeRebuilt((rebuiltTabId) => {
+      clearAttentionChimeKeys(attentionChimeEvents.current, rebuiltTabId);
+    });
+    return () => {
+      unsub();
+      unsubReady();
+      unsubRebuilt();
+    };
   }, []);
 
   const [workspacePanelResizing, setWorkspacePanelResizing] = useState(false);
@@ -1030,6 +1052,9 @@ export default function App() {
   const rightDockMode = useLayoutStore((s) => s.rightDockMode);
   const setRightDockMode = useLayoutStore((s) => s.setRightDockMode);
   const [dockRefreshKey, setDockRefreshKey] = useState(0);
+  const [fileRefRefreshKey, setFileRefRefreshKey] = useState(0);
+  const refreshComposerFileRefs = useCallback(() => setFileRefRefreshKey((value) => value + 1), []);
+  const composerFileRefRefreshKey = `${dockRefreshKey}:${fileRefRefreshKey}`;
   const [projectRevision, setProjectRevision] = useState(0);
   const [activeTopicTurns, setActiveTopicTurns] = useState<number | undefined>(undefined);
   const [composerInsertRequest, setComposerInsertRequest] = useState<ComposerInsertRequest | null>(null);
@@ -1038,6 +1063,7 @@ export default function App() {
   const transientOverlayDismissSignal = useOverlayStore((s) => s.transientOverlayDismissSignal);
   const setTransientOverlayDismissSignal = useOverlayStore((s) => s.setTransientOverlayDismissSignal);
   const [desktopPlatform, setDesktopPlatform] = useState<DesktopPlatform>(detectBrowserPlatform);
+  useWailsResizeFix(desktopPlatform === "windows");
   const [statusBarStyle, setStatusBarStyle] = useState<"icon" | "text">("text");
   const [statusBarItems, setStatusBarItems] = useState<StatusBarItemId[]>(() => [...DEFAULT_STATUS_BAR_ITEMS]);
   const [renamingTopicId, setRenamingTopicId] = useState<string | null>(null);
@@ -2274,8 +2300,8 @@ export default function App() {
 
   // send wrapper: commits any pending optimistic rewind before sending.
   const commitThenSend = useCallback(async (displayText: string, submitText?: string) => {
-    if (activeTab?.readOnly) throw new Error("channel session is read-only");
-    if (!controllerReady) throw new Error("workspace is still starting");
+    if (activeTab?.readOnly) throw new Error(t("composer.readOnlyChannel"));
+    if (!controllerReady) throw new Error(t("composer.workspaceStarting"));
     const rs = rewindStateRef.current;
     if (rs) {
       rewindStateRef.current = null;
@@ -2291,7 +2317,7 @@ export default function App() {
         // Rewind failed: the Go conversation is intact. Do not send; the
         // controller emits a notice with the reason.
         setRewindState(null);
-        throw new Error("rewind failed");
+        throw new Error(t("rewind.failed"));
       }
       setRewindSignal((v) => v + 1);
       if (rs.scope === "both") {
@@ -2301,7 +2327,7 @@ export default function App() {
       }
     }
     await send(displayText, submitText);
-  }, [activeTab?.readOnly, controllerReady, send, rewind]);
+  }, [activeTab?.readOnly, controllerReady, send, rewind, t]);
 
   const handleTranscriptPrompt = useCallback((text: string) => {
     if (!controllerReady) return;
@@ -2543,7 +2569,7 @@ export default function App() {
       } else {
         throw new Error(scope === "global" && !session.topicId
           ? t("history.failedOpenSession")
-          : (session.topicId ? "Missing workspaceRoot" : t("history.failedOpenSession")));
+          : (session.topicId ? t("history.missingWorkspaceRoot") : t("history.failedOpenSession")));
       }
       if (!latest()) return;
       seedActiveTabMeta(targetTab);
@@ -2587,6 +2613,11 @@ export default function App() {
   const openBlankSession = useCallback((scope: string, workspaceRoot: string): Promise<void> =>
     enqueueNavigation({ kind: "blank", scope, workspaceRoot: scope === "project" ? workspaceRoot : "" }),
   [enqueueNavigation]);
+
+  useEffect(() => onSessionRecovered(() => {
+    setProjectRevision((value) => value + 1);
+    void refreshTabMetas();
+  }), [refreshTabMetas]);
 
   const handleNewTab = useCallback(async () => {
     closeTransientOverlays();
@@ -3538,6 +3569,7 @@ export default function App() {
               retry={state.retry}
               transientDismissSignal={transientOverlayDismissSignal}
               sessionKey={composerSessionKey}
+              fileRefRefreshKey={composerFileRefRefreshKey}
               guidanceConsumedKey={latestGuidanceConsumed?.key}
               guidanceConsumedText={latestGuidanceConsumed?.text}
               guidanceQueuePreviewItems={guidanceQueueMockItems}
@@ -3656,6 +3688,7 @@ export default function App() {
                   onPreviewModeChange={handleWorkspacePreviewModeChange}
                   onAddToChat={addWorkspaceTextToComposer}
                   onRequestPanelWidth={ensureWorkspacePanelWidth}
+                  onFileTreeRefresh={refreshComposerFileRefs}
                   refreshKey={dockRefreshKey}
                   initialViewMode={rightDockMode === "changed" ? "changed" : "files"}
                   showViewTabs={false}

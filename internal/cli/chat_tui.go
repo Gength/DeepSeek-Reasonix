@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"strconv"
 	"strings"
 	"time"
@@ -289,6 +290,12 @@ type chatTUI struct {
 	modelRef        string
 	effortLevel     string // "" when the current provider/model has no configurable effort
 
+	// leases owns the session lease guarding the TUI's active session file (set
+	// by chatREPL; nil in tests and when persistence is disabled). Every in-TUI
+	// operation that rebinds the controller to another session file must move
+	// the lease first — see rebindSessionLease / followSessionLease.
+	leases *control.SessionLeaseKeeper
+
 	// outputStyle is the active output-style name (config agent.output_style),
 	// shown as the current entry in the /output-style listing. "" = default.
 	outputStyle string
@@ -394,14 +401,20 @@ func (m chatTUI) runStatusline() tea.Cmd {
 	return func() tea.Msg { return statuslineMsg{out: runStatuslineCmd(cmd, string(payload))} }
 }
 
+const statuslineCommandTimeout = 2 * time.Second
+
 // runStatuslineCmd runs a status-line command with the JSON context on stdin and
 // returns its first stdout line (status lines are a single row). A tight timeout
 // keeps a slow script from stalling the UI; any failure collapses to "".
 func runStatuslineCmd(cmd, stdinPayload string) string {
+	return runStatuslineCmdWithTimeout(cmd, stdinPayload, statuslineCommandTimeout)
+}
+
+func runStatuslineCmdWithTimeout(cmd, stdinPayload string, timeout time.Duration) string {
 	res := hook.DefaultSpawner(context.Background(), hook.SpawnInput{
 		Command: cmd,
 		Stdin:   stdinPayload + "\n",
-		Timeout: 2 * time.Second,
+		Timeout: timeout,
 	})
 	out := strings.TrimSpace(res.Stdout)
 	if i := strings.IndexByte(out, '\n'); i >= 0 {
@@ -1249,8 +1262,8 @@ func (m chatTUI) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			// Slash commands run locally without going through the model. A
 			// '/'-leading line that's actually a dragged file path is an attachment,
 			// not a command, so it's rewritten to an @reference instead.
-			if strings.HasPrefix(line, "//") {
-				// Double-slash — common in JS comments, file:// URLs, etc.
+			if control.SlashCodeCommentLine(line) {
+				// Slash-prefixed code comments are prompt text, not commands.
 				// Not a command. Fall through to normal message path.
 			} else if strings.HasPrefix(line, "/") {
 				if ref, ok := control.FileRefLine(line); ok {
@@ -1374,6 +1387,11 @@ func (m chatTUI) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if msg.oldCtrl != nil {
 				m.oldControllers = append(m.oldControllers, msg.oldCtrl)
 			}
+			// The lease follows the controller's session file. Normally a
+			// no-op (a carried conversation keeps its file); it moves when
+			// the pre-switch snapshot recovered onto a recovery branch — a
+			// fresh file created by this process, so failure is theoretical.
+			m.followSessionLease()
 			m.notice(fmt.Sprintf(i18n.M.ModelSwitchedFmt, m.label))
 			cmds = append(cmds, fetchBalance(m.ctrl))
 			if c := m.runStatusline(); c != nil {
@@ -1465,6 +1483,7 @@ func (m chatTUI) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 	}
 
+	beforeInput := m.input.Value()
 	var ic tea.Cmd
 	m.input, ic = m.input.Update(msg)
 	cmds = append(cmds, ic)
@@ -1473,8 +1492,23 @@ func (m chatTUI) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	if _, ok := msg.(tea.KeyPressMsg); ok {
 		m.updateCompletion()
 	}
+	if shouldClearWideInputChange(beforeInput, m.input.Value()) {
+		cmds = append(cmds, tea.ClearScreen)
+	}
 
 	return m, finalize(m, cmds)
+}
+
+var clearWideInputChanges = runtime.GOOS == "windows"
+
+func shouldClearWideInputChange(before, after string) bool {
+	return clearWideInputChanges &&
+		before != after &&
+		(hasWideInputCells(before) || hasWideInputCells(after))
+}
+
+func hasWideInputCells(s string) bool {
+	return s != "" && visibleWidth(s) != utf8.RuneCountInString(s)
 }
 
 // finalize drains the committed-line queue and batches the turn's commands. In
@@ -2245,11 +2279,15 @@ const planApprovalTool = "exit_plan_mode"
 
 // handleApprovalKey resolves a pending approval from a keystroke and re-arms the
 // listener. 1/y/Enter allows once, 2/a allows for the rest of the session,
-// 3/p writes an "always allow" rule to the config file, and n/Esc denies.
+// 3/p writes an "always allow" rule to the config file for ordinary tool
+// approvals. Fresh two-choice prompts use 2 for deny, while n/Esc and legacy 4
+// still deny.
 // Ctrl-C cancels the whole turn via the run context. For a plan approval
 // (planApprovalTool), allowing also drops the local [plan] tag — the
 // controller turns plan mode off on its side.
 func (m chatTUI) handleApprovalKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
+	freshToolApproval := control.RequiresFreshHumanApprovalTool(m.pendingApproval.Tool) && m.pendingApproval.Tool != planApprovalTool
+	freshSessionApproval := freshApprovalAllowsSession(m.pendingApproval.Tool)
 	answer := func(allow, session, persist bool) (tea.Model, tea.Cmd) {
 		if allow && m.pendingApproval.Tool == planApprovalTool {
 			m.planMode = false
@@ -2271,13 +2309,29 @@ func (m chatTUI) handleApprovalKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	case "y", "1":
 		return answer(true, false, false)
 	case "a", "2":
+		if freshToolApproval && !freshSessionApproval {
+			if msg.String() == "2" {
+				return answer(false, false, false)
+			}
+			return m, nil
+		}
 		return answer(true, true, false)
 	case "3", "p":
+		if freshSessionApproval && msg.String() == "3" {
+			return answer(false, false, false)
+		}
+		if freshToolApproval {
+			return m, nil
+		}
 		return answer(true, true, true)
 	case "4", "n":
 		return answer(false, false, false)
 	}
 	return m, nil
+}
+
+func freshApprovalAllowsSession(toolName string) bool {
+	return toolName == control.SandboxEscapeApprovalTool
 }
 
 var (
@@ -2630,11 +2684,10 @@ func cacheRateLabel(format string, hit, denom int) string {
 func (m chatTUI) cacheTag() string {
 	now := ""
 	if u := m.ctrl.LastUsage(); u != nil {
-		d := u.CacheHitTokens + u.CacheMissTokens
-		if d == 0 {
-			d = u.PromptTokens
-		}
-		now = cacheRateLabel(i18n.M.ChatStatusCacheNowFmt, u.CacheHitTokens, d)
+		// Only render when the provider actually reports cache token fields:
+		// falling back to PromptTokens as the denominator painted a bogus
+		// "turn hit 0.00%" for providers with no prompt-cache support.
+		now = cacheRateLabel(i18n.M.ChatStatusCacheNowFmt, u.CacheHitTokens, u.CacheHitTokens+u.CacheMissTokens)
 	}
 	avg := ""
 	if hit, miss := m.ctrl.SessionCache(); hit+miss > 0 {
@@ -2724,8 +2777,17 @@ func (m chatTUI) renderApprovalBanner() string {
 	}
 	exactSessionRule := permission.SessionGrantRuleForScope(m.pendingApproval.Tool, m.pendingApproval.Subject)
 	exactPersistentRule := permission.RememberRuleForScope(m.pendingApproval.Tool, m.pendingApproval.Subject)
-	choices := fmt.Sprintf(i18n.M.ToolApprovalChoices, exactSessionRule, exactPersistentRule)
-	if m.pendingApproval.Tool == "bash" && permission.BashCommandPrefix(m.pendingApproval.Subject) != "" {
+	choices := i18n.M.FreshHumanApprovalChoices
+	if !control.RequiresFreshHumanApprovalTool(m.pendingApproval.Tool) {
+		choices = fmt.Sprintf(i18n.M.ToolApprovalChoices, exactSessionRule, exactPersistentRule)
+	}
+	if m.pendingApproval.Tool == control.SandboxEscapeApprovalTool {
+		choices = i18n.M.SandboxEscapeApprovalChoices
+	}
+	if m.pendingApproval.Tool == agent.PlanModeReadOnlyCommandApprovalTool {
+		choices = i18n.M.PlanModeReadOnlyCommandChoices
+	}
+	if !control.RequiresFreshHumanApprovalTool(m.pendingApproval.Tool) && m.pendingApproval.Tool == "bash" && permission.BashCommandPrefix(m.pendingApproval.Subject) != "" {
 		prefixRule := permission.RememberRuleForScope(m.pendingApproval.Tool, m.pendingApproval.Subject)
 		choices = fmt.Sprintf(i18n.M.BashPrefixChoices, prefixRule, prefixRule)
 	}
@@ -2740,6 +2802,12 @@ func (m chatTUI) renderApprovalBanner() string {
 // MCP tools are advertised as mcp__<server>__<tool>; showing the short tool name
 // first keeps the approval prompt readable while preserving the source.
 func approvalToolDetails(toolName string) (name, detail string) {
+	if toolName == agent.PlanModeReadOnlyCommandApprovalTool {
+		return i18n.M.ApprovalToolLabelPlanModeReadOnly, fmt.Sprintf(i18n.M.ToolApprovalSourceFmt, i18n.M.ToolApprovalBuiltIn)
+	}
+	if toolName == control.SandboxEscapeApprovalTool {
+		return i18n.M.ApprovalToolLabelSandboxEscape, fmt.Sprintf(i18n.M.ToolApprovalSourceFmt, i18n.M.ToolApprovalBuiltIn)
+	}
 	if server, short, ok := tool.SplitMCPName(toolName); ok {
 		lines := []string{}
 		if strings.EqualFold(short, "understand_image") {
@@ -2748,7 +2816,32 @@ func approvalToolDetails(toolName string) (name, detail string) {
 		lines = append(lines, fmt.Sprintf(i18n.M.ToolApprovalSourceFmt, server))
 		return short, strings.Join(lines, "\n")
 	}
-	return toolName, fmt.Sprintf(i18n.M.ToolApprovalSourceFmt, i18n.M.ToolApprovalBuiltIn)
+	return approvalToolLabel(toolName), fmt.Sprintf(i18n.M.ToolApprovalSourceFmt, i18n.M.ToolApprovalBuiltIn)
+}
+
+func approvalToolLabel(toolName string) string {
+	switch toolName {
+	case "bash":
+		return i18n.M.ApprovalToolLabelBash
+	case "edit_file":
+		return i18n.M.ApprovalToolLabelEditFile
+	case "write_file":
+		return i18n.M.ApprovalToolLabelWriteFile
+	case "multi_edit":
+		return i18n.M.ApprovalToolLabelMultiEdit
+	case "move_file":
+		return i18n.M.ApprovalToolLabelMoveFile
+	case "web_fetch":
+		return i18n.M.ApprovalToolLabelWebFetch
+	case "run_skill":
+		return i18n.M.ApprovalToolLabelRunSkill
+	case "remember":
+		return i18n.M.ApprovalToolLabelRemember
+	case "forget":
+		return i18n.M.ApprovalToolLabelForget
+	default:
+		return toolName
+	}
 }
 
 // todoPanelMaxRows caps how many task lines the pinned panel shows; a long list
@@ -3419,6 +3512,7 @@ func (m *chatTUI) runSlashCommand(input string) tea.Cmd {
 			m.notice(fmt.Sprintf("%s: %v", i18n.M.SlashNewFailed, err))
 			return nil
 		}
+		m.followSessionLease()
 		// Native scrollback keeps the old transcript; mark the fork with a fresh banner.
 		m.resetFreshContextView(false)
 		m.notice(i18n.M.SlashNewDone)
@@ -3476,6 +3570,9 @@ func (m *chatTUI) runSlashCommand(input string) tea.Cmd {
 	case "/mcp":
 		m.echoLocalCommand(input)
 		m.runMCPSubcommand(input)
+	case "/plugin", "/plugins":
+		m.echoLocalCommand(input)
+		m.runPluginSubcommand(input)
 	case "/model":
 		m.echoLocalCommand(input)
 		m.runModelSubcommand(input)
@@ -3818,7 +3915,7 @@ func (m *chatTUI) showSandboxStatus() {
 	b.WriteString("  phase 1  OS bash sandbox\n")
 	fmt.Fprintf(&b, "    bash        %s", bash)
 	if bash == "enforce" && !available {
-		b.WriteString(" (inactive: no OS sandbox on this host — bash runs unconfined)")
+		b.WriteString(" (unavailable: no OS sandbox on this host; bash execution is refused. " + sandbox.UnavailableRemediation() + ")")
 	}
 	b.WriteString("\n")
 	fmt.Fprintf(&b, "    network     %v\n", network)

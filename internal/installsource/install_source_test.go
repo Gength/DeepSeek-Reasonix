@@ -140,6 +140,98 @@ func TestApplyLocalSkillRootRegistersPath(t *testing.T) {
 	}
 }
 
+func TestApplyLocalCodexPluginPackage(t *testing.T) {
+	project := t.TempDir()
+	home := t.TempDir()
+	src := filepath.Join(t.TempDir(), "superpowers")
+	writeFile(t, filepath.Join(src, ".codex-plugin", "plugin.json"), `{
+  "name": "superpowers",
+  "version": "6.1.0",
+  "description": "Planning workflows",
+  "skills": "./skills/"
+}`)
+	writeFile(t, filepath.Join(src, "skills", "using-superpowers", "SKILL.md"), "---\nname: using-superpowers\ndescription: Use skills\n---\nUse skills.")
+	writeFile(t, filepath.Join(src, "hooks", "session-start-codex"), "#!/usr/bin/env bash\necho ok\n")
+
+	tl := NewTool(Options{ProjectRoot: project, HomeDir: home})
+	planned := execInstall(t, tl, map[string]any{
+		"source": src,
+		"kind":   "plugin",
+	})
+	if planned.Kind != "plugin" || planned.Kinds.Plugin != 1 {
+		t.Fatalf("planned = %+v, want one plugin action", planned)
+	}
+	if planned.Actions[0].Name != "superpowers" || planned.Actions[0].SkillCount != 1 || planned.Actions[0].HookCount != 1 {
+		t.Fatalf("plugin action = %+v", planned.Actions[0])
+	}
+
+	done := execInstall(t, tl, map[string]any{
+		"source": src,
+		"kind":   "plugin",
+		"apply":  true,
+	})
+	if !done.OK || done.Status != "done" {
+		t.Fatalf("apply response = %+v", done)
+	}
+	statePath := filepath.Join(home, ".reasonix", "plugin-packages.json")
+	raw, err := os.ReadFile(statePath)
+	if err != nil {
+		t.Fatalf("state file missing: %v", err)
+	}
+	if !strings.Contains(string(raw), `"name": "superpowers"`) || !strings.Contains(string(raw), `"manifestKind": "codex"`) {
+		t.Fatalf("state file = %s", raw)
+	}
+	if _, err := os.Stat(filepath.Join(home, ".reasonix", "plugins", "superpowers", ".codex-plugin", "plugin.json")); err != nil {
+		t.Fatalf("installed plugin missing: %v", err)
+	}
+}
+
+func TestApplyLocalClaudePluginPackage(t *testing.T) {
+	project := t.TempDir()
+	home := t.TempDir()
+	src := filepath.Join(t.TempDir(), "ui-ux-pro-max")
+	writeFile(t, filepath.Join(src, ".claude-plugin", "plugin.json"), `{
+  "name": "ui-ux-pro-max",
+  "version": "2.6.2",
+  "description": "UI/UX design intelligence",
+  "skills": "./.claude/skills/"
+}`)
+	writeFile(t, filepath.Join(src, ".claude", "skills", "ui-ux-pro-max", "SKILL.md"), "---\nname: ui-ux-pro-max\ndescription: UI design helper\n---\nUse design rules.")
+	writeFile(t, filepath.Join(src, "CLAUDE.md"), "Use the bundled UI workflow.")
+
+	tl := NewTool(Options{ProjectRoot: project, HomeDir: home})
+	planned := execInstall(t, tl, map[string]any{
+		"source": src,
+		"kind":   "plugin",
+	})
+	if planned.Kind != "plugin" || planned.Kinds.Plugin != 1 {
+		t.Fatalf("planned = %+v, want one plugin action", planned)
+	}
+	if planned.Actions[0].Name != "ui-ux-pro-max" || planned.Actions[0].ManifestKind != "claude" || planned.Actions[0].SkillCount != 1 || planned.Actions[0].HookCount != 1 {
+		t.Fatalf("plugin action = %+v", planned.Actions[0])
+	}
+
+	done := execInstall(t, tl, map[string]any{
+		"source": src,
+		"kind":   "plugin",
+		"apply":  true,
+	})
+	if !done.OK || done.Status != "done" {
+		t.Fatalf("apply response = %+v", done)
+	}
+	statePath := filepath.Join(home, ".reasonix", "plugin-packages.json")
+	raw, err := os.ReadFile(statePath)
+	if err != nil {
+		t.Fatalf("state file missing: %v", err)
+	}
+	if !strings.Contains(string(raw), `"name": "ui-ux-pro-max"`) || !strings.Contains(string(raw), `"manifestKind": "claude"`) {
+		t.Fatalf("state file = %s", raw)
+	}
+	if _, err := os.Stat(filepath.Join(home, ".reasonix", "plugins", "ui-ux-pro-max", ".claude-plugin", "plugin.json")); err != nil {
+		t.Fatalf("installed plugin missing: %v", err)
+	}
+}
+
 func TestApplyLocalSkillFileCopiesToProject(t *testing.T) {
 	project := t.TempDir()
 	home := t.TempDir()
@@ -381,6 +473,16 @@ func TestParseSkillContentStrictAllowsMissingDescription(t *testing.T) {
 
 	if _, err := parseSkillContent("---\nname: strict\n---\nbody", "strict", "in-memory", true); err == nil {
 		t.Fatal("strict=true should reject missing description")
+	}
+}
+
+func TestParseSkillContentRejectsMalformedFrontmatter(t *testing.T) {
+	_, err := parseSkillContent("---\nname: [broken\n---\nbody", "broken", "in-memory", true)
+	if err == nil {
+		t.Fatal("malformed frontmatter should fail")
+	}
+	if !strings.Contains(err.Error(), "invalid YAML") || !strings.Contains(strings.ToLower(err.Error()), "line") {
+		t.Fatalf("error = %v, want invalid YAML with location", err)
 	}
 }
 
