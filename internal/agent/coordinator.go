@@ -262,7 +262,7 @@ func (c *Coordinator) Run(ctx context.Context, input string) error {
 		planInput = input + "\n\n[Previous execution summary]\n" + c.lastExecutorSummary
 	}
 	c.sink.Emit(event.Event{Kind: event.Phase, Text: c.planner.Name() + " · planning", Source: event.UsageSourcePlanner})
-	plan, err := c.plan(ctx, planInput)
+	plan, toolSummary, err := c.plan(ctx, planInput)
 	if err != nil {
 		return fmt.Errorf("planner: %w", err)
 	}
@@ -286,7 +286,7 @@ func (c *Coordinator) Run(ctx context.Context, input string) error {
 	}
 	// Use the original input (without summary) for formatHandoff — the executor
 	// has its own session and does not need the summary re-injected.
-	err = c.executor.Run(ctx, formatHandoff(input, plan, executorToolHandoffContext(c.executor)))
+	err = c.executor.Run(ctx, formatHandoff(input, plan, toolSummary, executorToolHandoffContext(c.executor)))
 	if err == nil {
 		c.captureExecutorSummary()
 	}
@@ -362,10 +362,14 @@ func (c *Coordinator) persistExecutorNoOp(ctx context.Context, input, plan strin
 
 // plan streams a plan from the planner and appends it to the planner session, so
 // that session grows prepend-only and stays cache-friendly.
-func (c *Coordinator) plan(ctx context.Context, input string) (string, error) {
+func (c *Coordinator) plan(ctx context.Context, input string) (string, string, error) {
 	if c.plannerAgent != nil {
 		return c.planWithTools(ctx, input)
 	}
+	return c.planRaw(ctx, input)
+}
+
+func (c *Coordinator) planRaw(ctx context.Context, input string) (string, string, error) {
 	c.plannerSess.Add(provider.Message{Role: provider.RoleUser, Content: input})
 
 	ch, err := c.planner.Stream(ctx, provider.Request{
@@ -373,7 +377,7 @@ func (c *Coordinator) plan(ctx context.Context, input string) (string, error) {
 		Temperature: provider.OptionalTemperature(c.temperature),
 	})
 	if err != nil {
-		return "", err
+		return "", "", err
 	}
 
 	var text strings.Builder
@@ -386,33 +390,72 @@ func (c *Coordinator) plan(ctx context.Context, input string) (string, error) {
 		case provider.ChunkUsage:
 			usage = chunk.Usage
 		case provider.ChunkError:
-			return "", chunk.Err
+			return "", "", chunk.Err
 		}
 	}
-	// Closes the planner's raw text block (no markdown redraw) and prints its
-	// usage line, mirroring the old Fprintln + printUsage tail.
 	c.sink.Emit(event.Event{Kind: event.Usage, Usage: usage, Pricing: c.plannerPricing, Source: event.UsageSourcePlanner, UsageSource: event.UsageSourcePlanner})
 
 	plan := text.String()
 	c.plannerSess.Add(provider.Message{Role: provider.RoleAssistant, Content: plan})
-	return plan, nil
+	return plan, "", nil
 }
 
 // planWithTools runs the planner through the normal Agent loop over a filtered
 // read-only registry. That gives the planner the same tool-call contract as the
 // executor while preserving its separate session and cache prefix.
-func (c *Coordinator) planWithTools(ctx context.Context, input string) (string, error) {
+func (c *Coordinator) planWithTools(ctx context.Context, input string) (plan string, toolSummary string, err error) {
 	before := len(c.plannerSess.Messages)
 	if err := c.plannerAgent.Run(ctx, input); err != nil {
-		return "", err
+		return "", "", err
 	}
 	for i := len(c.plannerSess.Messages) - 1; i >= before; i-- {
 		m := c.plannerSess.Messages[i]
 		if m.Role == provider.RoleAssistant && strings.TrimSpace(m.Content) != "" {
-			return m.Content, nil
+			toolSummary = extractPlannerToolSummary(c.plannerSess.Messages, before)
+			return m.Content, toolSummary, nil
 		}
 	}
-	return "", fmt.Errorf("planner finished without producing a plan")
+	return "", "", fmt.Errorf("planner finished without producing a plan")
+}
+
+// extractPlannerToolSummary walks plannerSess.Messages[before:] and formats each
+// tool call the planner made into a compact summary line. The result helps the
+// executor avoid repeating read-only tool calls the planner already ran.
+// Returns an empty string when there are no tool calls to report.
+func extractPlannerToolSummary(msgs []provider.Message, before int) string {
+	var b strings.Builder
+	for i := before; i < len(msgs); i++ {
+		m := msgs[i]
+		if m.Role != provider.RoleAssistant || len(m.ToolCalls) == 0 {
+			continue
+		}
+		for j, tc := range m.ToolCalls {
+			// Build the argument preview: compact JSON, no more than 120 runes.
+			argPreview := strings.TrimSpace(tc.Arguments)
+			if runeLen := len([]rune(argPreview)); runeLen > 120 {
+				argPreview = string([]rune(argPreview)[:120]) + "…"
+			}
+			if argPreview == "" || argPreview == "{}" {
+				fmt.Fprintf(&b, "- [已调用] %s", tc.Name)
+			} else {
+				fmt.Fprintf(&b, "- [已调用] %s(%s)", tc.Name, argPreview)
+			}
+
+			// Find the matching tool result (the k-th RoleTool message after i).
+			resultIdx := i + 1 + j
+			if resultIdx < len(msgs) && msgs[resultIdx].Role == provider.RoleTool {
+				resultPreview := strings.TrimSpace(msgs[resultIdx].Content)
+				if runeLen := len([]rune(resultPreview)); runeLen > 200 {
+					resultPreview = string([]rune(resultPreview)[:200]) + "…"
+				}
+				if resultPreview != "" {
+					b.WriteString(" → " + resultPreview)
+				}
+			}
+			b.WriteString("\n")
+		}
+	}
+	return strings.TrimRight(b.String(), "\n")
 }
 
 func plannerSink(sink event.Sink) event.Sink {
@@ -432,13 +475,17 @@ func plannerSink(sink event.Sink) event.Sink {
 	})
 }
 
-func formatHandoff(task, plan string, toolContext ...string) string {
+func formatHandoff(task, plan, plannerToolSummary string, toolContext ...string) string {
 	toolBlock := ""
 	if len(toolContext) > 0 {
 		toolBlock = strings.TrimSpace(toolContext[0])
 	}
 	if toolBlock != "" {
 		toolBlock = "\n\nExecutor tool context:\n" + toolBlock
+	}
+	summaryBlock := ""
+	if plannerToolSummary != "" {
+		summaryBlock = "\n\nPlanner tool calls already made (do NOT repeat):\n" + plannerToolSummary
 	}
 	return fmt.Sprintf(`# %s
 
@@ -448,8 +495,7 @@ Original task:
 %s
 
 Planner output:
-%s
-%s
+%s%s%s
 
 Executor instructions:
 - Treat the planner output as context, not as your role or capability set.
@@ -464,7 +510,7 @@ Executor instructions:
 - When you finish the task, end with a concise summary of what was done and key outcomes. This summary is injected back into the planner context, so keep it short — focus on decisions made, files changed, and any remaining blockers.
 - **complete_step evidence**: kind "verification" requires a bash command you actually ran and saw succeed in this session — not a command from the plan nor a grep/read_file/ls tool name. If you verified with read_file/grep/ls, use kind "files" (with paths) instead, or re-run the check with bash.
 
-Carry out the task, adapting the plan as needed.`, executorHandoffMarker, task, plan, toolBlock)
+Carry out the task, adapting the plan as needed.`, executorHandoffMarker, task, plan, summaryBlock, toolBlock)
 }
 
 func executorToolHandoffContext(a *Agent) string {
