@@ -1068,19 +1068,19 @@ func Build(ctx context.Context, opts Options) (*control.Controller, error) {
 			plannerSess := agent.NewSession(agent.PlannerPromptWithContext(mem.Block()))
 			plannerTools := agent.PlannerToolRegistry(reg, cfg.Agent.PlannerAllowedTools...)
 			runner = agent.NewCoordinator(plannerProv, plannerSess, pe.Price, plannerTools, agent.Options{
-		MaxSteps:             cfg.Agent.PlannerMaxSteps,
-				MaxStepsKey:          "agent.planner_max_steps",
-				Gate:                 headlessGate,
-				ContextWindow:        pe.ContextWindow,
-				SoftCompactRatio:     cfg.Agent.SoftCompactRatio,
-				ToolResultSnipRatio:  cfg.Agent.ToolResultSnipRatio,
-				CompactRatio:         cfg.Agent.CompactRatio,
-				CompactForceRatio:    cfg.Agent.CompactForceRatio,
-				RecentKeep:           cfg.Agent.RecentKeep,
-				ArchiveDir:           config.ArchiveDir(),
-				KeepPolicy:           keepPolicy,
-				ReasoningLanguage:    cfg.ReasoningLanguage(),
-				PlanModeAllowedTools: cfg.Agent.PlannerAllowedTools,
+				MaxSteps:                 cfg.Agent.PlannerMaxSteps,
+				MaxStepsKey:              "agent.planner_max_steps",
+				Gate:                     headlessGate,
+				ContextWindow:            pe.ContextWindow,
+				SoftCompactRatio:         cfg.Agent.SoftCompactRatio,
+				ToolResultSnipRatio:      cfg.Agent.ToolResultSnipRatio,
+				CompactRatio:             cfg.Agent.CompactRatio,
+				CompactForceRatio:        cfg.Agent.CompactForceRatio,
+				RecentKeep:               cfg.Agent.RecentKeep,
+				ArchiveDir:               config.ArchiveDir(),
+				KeepPolicy:               keepPolicy,
+				ReasoningLanguage:        cfg.ReasoningLanguage(),
+				PlanModeAllowedTools:     cfg.Agent.PlannerAllowedTools,
 				PlanModeReadOnlyCommands: cfg.Agent.PlanModeReadOnlyCommands,
 			}, executor, cfg.Agent.Temperature, sink, control.NewPlannerGate(classifier))
 			label = entry.Model + " + planner " + pe.Model
