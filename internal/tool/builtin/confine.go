@@ -35,6 +35,13 @@ func ConfineWebFetch(proxySpec netclient.ProxySpec) tool.Tool {
 	return webFetch{proxySpec: proxySpec}
 }
 
+// ConfineWebSearch returns the web_search built-in bound to the DeepSeek
+// provider credentials. When apiKey is empty (non-DeepSeek provider), the
+// tool's Execute returns a clear error suggesting alternatives.
+func ConfineWebSearch(apiKey, baseURL, model string) tool.Tool {
+	return webSearch{apiKey: apiKey, baseURL: baseURL, model: model}
+}
+
 // ConfineWriters returns the file-writing built-ins (write_file, edit_file,
 // multi_edit, move_file, notebook_edit) bound to roots — the only directories they may
 // modify. The composition root adds these to the per-run registry to override

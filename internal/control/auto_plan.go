@@ -81,7 +81,7 @@ func (c *Controller) shouldAutoPlan(ctx context.Context, input string) bool {
 func TaskWarrantsPlanner(input string) bool {
 	text := strings.TrimSpace(agent.StripTransientUserBlocks(input))
 	text = stripActiveGoalBlock(text)
-	if text == "" || strings.HasPrefix(text, "/") {
+	if text == "" || strings.HasPrefix(text, "/") || strings.HasPrefix(text, PlanModeMarker) {
 		return false
 	}
 	if IsSyntheticUserMessage(text) {
@@ -291,11 +291,6 @@ func NewPlannerGate(classifier AutoPlanClassifier) func(string) bool {
 		return TaskWarrantsPlanner
 	}
 	return func(input string) bool {
-		// PlanModeMarker means the user explicitly entered plan mode — always
-		// route to the planner model (deepseek-pro), bypass the classifier.
-		if strings.HasPrefix(strings.TrimSpace(input), PlanModeMarker) {
-			return true
-		}
 		if !TaskWarrantsPlanner(input) {
 			return false
 		}

@@ -26,15 +26,18 @@ import (
 // rejects writer-tool targets inside Reasonix's own session stores and makes
 // bash warn when a command references them (see SessionDataGuard).
 type Workspace struct {
-	Dir             string
-	WriteRoots      []string
-	ForbidReadRoots []string
-	Bash            sandbox.Spec
-	BashTimeout     time.Duration
-	Search          SearchSpec
-	ProxySpec       netclient.ProxySpec
-	ReadPaths       *PathResolver
-	SessionGuard    SessionDataGuard
+	Dir              string
+	WriteRoots       []string
+	ForbidReadRoots  []string
+	Bash             sandbox.Spec
+	BashTimeout      time.Duration
+	Search           SearchSpec
+	ProxySpec        netclient.ProxySpec
+	ReadPaths        *PathResolver
+	SessionGuard     SessionDataGuard
+	WebSearchAPIKey  string
+	WebSearchBaseURL string
+	WebSearchModel   string
 }
 
 // Tools returns the built-in tools bound to the workspace, ready to Add to a
@@ -65,6 +68,7 @@ func (w Workspace) Tools(enabled ...string) []tool.Tool {
 		"glob":          globTool{workDir: w.Dir, paths: w.ReadPaths, forbidRoots: forbidRoots},
 		"grep":          grepTool{workDir: w.Dir, paths: w.ReadPaths, rg: w.Search.RgPath, forbidRoots: forbidRoots, sb: w.Bash},
 		"web_fetch":     webFetch{proxySpec: w.ProxySpec},
+		"web_search":    webSearch{apiKey: w.WebSearchAPIKey, baseURL: w.WebSearchBaseURL, model: w.WebSearchModel},
 	}
 	all := tool.Builtins()
 	if len(enabled) == 0 {

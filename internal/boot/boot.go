@@ -327,7 +327,16 @@ func Build(ctx context.Context, opts Options) (*control.Controller, error) {
 		enabledBuiltins = tokenEconomyBuiltins(enabledBuiltins)
 	}
 	readPathResolver := builtin.NewPathResolver()
-	addBuiltins(reg, enabledBuiltins, cfg.WriteRootsForRoot(root), bashSpec, bashTimeout, searchSpec, stderr, root, proxySpec, cfg.ForbidReadRootsForRoot(root), readPathResolver, sessionGuard)
+	// Resolve web search credentials for DeepSeek providers.
+	webSearchAPIKey := ""
+	webSearchBaseURL := ""
+	webSearchModel := ""
+	if strings.Contains(entry.BaseURL, "deepseek.com") {
+		webSearchAPIKey = entry.APIKey()
+		webSearchBaseURL = entry.BaseURL + "/anthropic"
+		webSearchModel = entry.Model
+	}
+	addBuiltins(reg, enabledBuiltins, cfg.WriteRootsForRoot(root), bashSpec, bashTimeout, searchSpec, stderr, root, proxySpec, cfg.ForbidReadRootsForRoot(root), readPathResolver, sessionGuard, webSearchAPIKey, webSearchBaseURL, webSearchModel)
 	// Use the caller-supplied shared host when set, so controllers for the same
 	// workspace root reuse running MCP processes (e.g. one CodeGraph daemon
 	// instead of one per tab). Otherwise construct a private host per controller.
@@ -1486,12 +1495,12 @@ func NewProviderWithProxy(e *config.ProviderEntry, proxy netclient.ProxySpec) (p
 // the process cwd, enabling concurrent multi-project sessions.
 // sessionGuard blocks writer-tool targets inside Reasonix's own session stores
 // and makes bash warn when a command references them.
-func addBuiltins(reg *tool.Registry, enabled, writeRoots []string, bashSpec sandbox.Spec, bashTimeout time.Duration, searchSpec builtin.SearchSpec, stderr io.Writer, workDir string, proxySpec netclient.ProxySpec, forbidReadRoots []string, readPathResolver *builtin.PathResolver, sessionGuard builtin.SessionDataGuard) {
+func addBuiltins(reg *tool.Registry, enabled, writeRoots []string, bashSpec sandbox.Spec, bashTimeout time.Duration, searchSpec builtin.SearchSpec, stderr io.Writer, workDir string, proxySpec netclient.ProxySpec, forbidReadRoots []string, readPathResolver *builtin.PathResolver, sessionGuard builtin.SessionDataGuard, webSearchAPIKey, webSearchBaseURL, webSearchModel string) {
 	// If a workspace directory is set, use workspace-bound tools that resolve
 	// paths relative to that directory. Otherwise fall back to the process-cwd
 	// compile-time builtins.
 	if workDir != "" {
-		ws := builtin.Workspace{Dir: workDir, WriteRoots: writeRoots, ForbidReadRoots: forbidReadRoots, Bash: bashSpec, BashTimeout: bashTimeout, Search: searchSpec, ProxySpec: proxySpec, ReadPaths: readPathResolver, SessionGuard: sessionGuard}
+		ws := builtin.Workspace{Dir: workDir, WriteRoots: writeRoots, ForbidReadRoots: forbidReadRoots, Bash: bashSpec, BashTimeout: bashTimeout, Search: searchSpec, ProxySpec: proxySpec, ReadPaths: readPathResolver, SessionGuard: sessionGuard, WebSearchAPIKey: webSearchAPIKey, WebSearchBaseURL: webSearchBaseURL, WebSearchModel: webSearchModel}
 		for _, t := range ws.Tools(enabled...) {
 			reg.Add(t)
 		}
@@ -1518,7 +1527,8 @@ func addBuiltins(reg *tool.Registry, enabled, writeRoots []string, bashSpec sand
 	confined := append(builtin.ConfineWriters(writeRoots, sessionGuard),
 		builtin.ConfineBash(bashSpec, sessionGuard, bashTimeout),
 		builtin.ConfineSearch(searchSpec, bashSpec, forbidReadRoots),
-		builtin.ConfineWebFetch(proxySpec))
+		builtin.ConfineWebFetch(proxySpec),
+		builtin.ConfineWebSearch(webSearchAPIKey, webSearchBaseURL, webSearchModel))
 	confined = append(confined, builtin.ConfineReaders(forbidReadRoots)...)
 	for _, t := range confined {
 		if _, ok := reg.Get(t.Name()); ok {

@@ -4,12 +4,55 @@ All notable changes to the Go line (Reasonix 1.0+) are recorded here. The legacy
 `0.x` TypeScript history lives on the [`v1`](https://github.com/esengine/DeepSeek-Reasonix/tree/v1)
 branch.
 
+## Unreleased
+
+### Added
+
+- **Planner MCP tool opt-in**: MCP tools are now opt-in for the planner. When
+  MCP servers are connected, only tools listed in the new `planner_allowed_tools`
+  config are visible to the planner; all other MCP tools are blocked. Built-in
+  read-only tools are unaffected. (`internal/agent/task.go`,
+  `internal/config/config.go`, `internal/config/render.go`,
+  `internal/boot/boot.go`)
+
+- **`web_search` built-in tool**: new read-only tool that uses DeepSeek's
+  native web search capability (`web_search_20250305`) via the
+  Anthropic-compatible API. Works out of the box for DeepSeek providers; for
+  non-DeepSeek providers it returns a clear error suggesting `web_fetch` or a
+  model switch. (`internal/tool/builtin/websearch.go`,
+  `internal/boot/boot.go`, `internal/tool/builtin/workspace.go`,
+  `internal/planmode/policy.go`)
+
+- **Executor summary feedback to Planner**: After each executor run, the
+  Coordinator caches the executor's final assistant message and injects it as
+  `[Previous execution summary]` into the planner's input on the next turn. This
+  keeps the planner aware of what was actually done. The cache is cleared on
+  `ResetPlannerSession` to avoid cross-session leakage.
+  (`internal/agent/coordinator.go`)
+
+- **Planner decomposition of requests**: The planner prompt now enforces
+  explicit request decomposition before any tool use: (1) identify the
+  Planner part (research), (2) identify the Executor part (code/commands),
+  (3) execute only the Planner part with read-only tools, (4) produce an
+  executor-ready plan. This prevents the planner from attempting side-effect
+  tools, failing, and recovering — saving tokens. (`internal/agent/coordinator.go`)
+
 ### Changed
 
 - Agent runtime defaults now leave both executor and dedicated planner tool-call
   rounds unlimited (`max_steps = 0`, `planner_max_steps = 0`). Step limits now
   come from the user/global config only; project `reasonix.toml` does not
   override them.
+
+### Fixed
+
+- **Planner tool results forwarded to executor**: When the planner calls
+  read-only tools (e.g. `web_fetch`, `web_search`), those results were
+  stored in the planner session but never forwarded to the executor during
+  handoff. The executor, unaware of what the planner already fetched, would
+  repeat the same tool calls — wasting tokens and API quota. Now the handoff
+  prompt includes a compact summary of planner tool calls so the executor
+  never repeats them. (#4051, `internal/agent/coordinator.go`)
 
 ## [1.0.0] — 2026-06-03
 

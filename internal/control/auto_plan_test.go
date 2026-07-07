@@ -24,7 +24,7 @@ func TestTaskWarrantsPlanner(t *testing.T) {
 		{"why did the test fail", false},
 		{"解释一下这段代码", false},
 		{reasoningLanguageBlock("zh") + "\n\nwhat does this function do?", false},
-		{reasoningLanguageBlock("en") + "\n\n" + PlanModeMarker + "\n\nfix the bug", true},
+		{reasoningLanguageBlock("en") + "\n\n" + PlanModeMarker + "\n\nfix the bug", false},
 		{reasoningLanguageBlock("en") + "\n\nfix the bug", true},
 		{"fix the bug", true},        // terse, but a work request → still planned
 		{"add a login button", true}, // ditto

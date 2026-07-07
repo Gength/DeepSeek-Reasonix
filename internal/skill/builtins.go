@@ -45,7 +45,7 @@ The 'task' the parent gave you is the question you must answer. Treat any other 
 const builtinResearchBody = `You are running as a research subagent. Gather information from code AND the web, synthesize it, and return one focused conclusion.
 
 How to operate:
-- Combine code reading (LSP for language semantics; code_index as the local symbol fallback; read_file, grep, glob for verification) with web_fetch as appropriate. (There is no dedicated web-search tool — fetch the canonical doc/spec URL directly when you know it.)
+- Combine code reading (LSP for language semantics; code_index as the local symbol fallback; read_file, grep, glob for verification) with web_fetch or web_search as appropriate. web_search uses the current model provider's native search capability (supported for DeepSeek models).
 - For "how does X work" questions: use symbol/reference lookup first when available; otherwise use code_index, then read_file for full context.
 - For "is Y supported" questions: fetch the canonical reference, then verify against the local code.
 - For "what's our policy on Z" / "where do we use Q": local code first, web only to compare against external standards.

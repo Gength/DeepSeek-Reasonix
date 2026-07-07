@@ -156,6 +156,7 @@ var planSafeReadOnly = map[string]bool{
 	"grep":        true,
 	"code_index":  true,
 	"web_fetch":   true,
+	"web_search":  true,
 	"bash_output": true, // observes an already-running job's buffered output; no new side effect
 	"wait":        true, // observes job status; cannot start, preserve, or kill processes
 }

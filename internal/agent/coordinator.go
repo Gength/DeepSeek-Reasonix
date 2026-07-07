@@ -67,9 +67,6 @@ type Coordinator struct {
 	// trivial, non-work turn (a question, a greeting) skip straight to the
 	// executor instead of paying a planner round on it.
 	shouldPlan func(string) bool
-	// planMode, when true, makes Run() stop after the planner produces its plan
-	// instead of handing off to the executor. Set from the outside via SetPlanMode.
-	planMode bool
 	// lastExecutorSummary caches the executor's final assistant message from the
 	// previous turn so the planner can see what was actually done on the next run.
 	lastExecutorSummary string
@@ -196,7 +193,6 @@ func (c *Coordinator) SetPlanMode(v bool) {
 	if c == nil {
 		return
 	}
-	c.planMode = v
 	if c.plannerAgent != nil {
 		c.plannerAgent.SetPlanMode(v)
 	}
@@ -265,17 +261,6 @@ func (c *Coordinator) Run(ctx context.Context, input string) error {
 	plan, toolSummary, err := c.plan(ctx, planInput)
 	if err != nil {
 		return fmt.Errorf("planner: %w", err)
-	}
-
-	// In plan mode, stop after planning — the plan is the output, executor is not invoked.
-	// Also add the plan as an assistant message to the executor's session so the
-	// turn orchestrator's plan-approval flow can extract it via lastAssistantText.
-	if c.planMode {
-		c.sink.Emit(event.Event{Kind: event.Text, Text: plan})
-		if c.executor != nil && c.executor.Session() != nil {
-			c.executor.Session().Add(provider.Message{Role: provider.RoleAssistant, Content: plan})
-		}
-		return nil
 	}
 
 	c.sink.Emit(event.Event{Kind: event.Phase, Text: c.executor.prov.Name() + " · executing", Source: event.UsageSourceExecutor})
