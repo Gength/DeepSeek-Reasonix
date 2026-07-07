@@ -62,11 +62,12 @@
   executor-ready plan. The executor then carries it out with full tool access.
   Each model runs in its own cache-stable session, so neither's prefix cache
   is disturbed by the other's turns.
-- **ExecutionSummary.md protocol.** The planner and executor communicate through
-  a durable file at the project root. After every turn, the executor appends a
-  dated summary block (timestamp, what was done, files changed, blockers,
-  state for the planner). The planner reads this file before producing every
-  plan — no more in-memory injection, no lost context.
+- **Executor summary feedback to Planner**: After each executor run, the
+  Coordinator caches the executor's final assistant message and injects it as
+  `[Previous execution summary]` into the planner's input on the next turn. This
+  keeps the planner aware of what was actually done. The cache is cleared on
+  `ResetPlannerSession` to avoid cross-session leakage.
+  (`internal/agent/coordinator.go`)
 - **Plan mode.** When enabled, the Coordinator stops after the planner produces
   its plan instead of unconditionally invoking the executor. This avoids wasted
   tokens from the executor re-doing read-only research the planner already
