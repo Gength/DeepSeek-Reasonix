@@ -462,6 +462,7 @@ Executor instructions:
 - If a target path is outside the writable workspace or otherwise blocked, explain that specific blocker and ask for the needed path/approval.
 - **Serial workflow**: establish the task list with one todo_write (first sub-task in_progress), then for EACH sub-task execute it and call complete_step with evidence. The host advances the list for you — it marks the sub-task completed and moves the next to in_progress, so you don't need another todo_write to mark completions. Sign off one sub-task at a time; never batch completions.
 - When you finish the task, end with a concise summary of what was done and key outcomes. This summary is injected back into the planner context, so keep it short — focus on decisions made, files changed, and any remaining blockers.
+- **complete_step evidence**: kind "verification" requires a bash command you actually ran and saw succeed in this session — not a command from the plan nor a grep/read_file/ls tool name. If you verified with read_file/grep/ls, use kind "files" (with paths) instead, or re-run the check with bash.
 
 Carry out the task, adapting the plan as needed.`, executorHandoffMarker, task, plan, toolBlock)
 }

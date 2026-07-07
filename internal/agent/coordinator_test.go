@@ -865,12 +865,22 @@ func TestCoordinatorLastExecutorSummaryInjected(t *testing.T) {
 	}
 
 	// The planner should have seen the summary in its input
-	lastUserMsg := lastUser(planner.lastReq)
-	if !strings.Contains(lastUserMsg, "Previous execution summary") {
-		t.Errorf("planner input should contain summary marker, got: %s", lastUserMsg)
+	planUserMsg := lastUser(planner.lastReq)
+	if !strings.Contains(planUserMsg, "Previous execution summary") {
+		t.Errorf("planner input should contain summary marker, got: %s", planUserMsg)
 	}
-	if !strings.Contains(lastUserMsg, "changed main.go") {
-		t.Errorf("planner input should contain summary content, got: %s", lastUserMsg)
+	if !strings.Contains(planUserMsg, "changed main.go") {
+		t.Errorf("planner input should contain summary content, got: %s", planUserMsg)
+	}
+
+	// The executor (which receives formatHandoff with original input) must NOT
+	// see the summary at all — the planInput variable is scoped to the planner.
+	execUserMsg := lastUser(exec.lastReq)
+	if strings.Contains(execUserMsg, "Previous execution summary") {
+		t.Errorf("executor input should NOT contain summary marker, got: %s", execUserMsg)
+	}
+	if strings.Contains(execUserMsg, "changed main.go") {
+		t.Errorf("executor input should NOT contain summary content, got: %s", execUserMsg)
 	}
 }
 

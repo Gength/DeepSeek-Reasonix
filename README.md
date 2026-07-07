@@ -16,6 +16,7 @@
   <strong><a href="https://discord.gg/XF78rEME2D">Discord</a></strong>
 </p>
 
+
 > [!IMPORTANT]
 > **Reasonix 1.0 is a ground-up rewrite in Go** — this branch (`main-v2`) is the new default and where development happens now.
 > The earlier `0.x` TypeScript releases are **legacy**, living on the [`v1`](https://github.com/esengine/DeepSeek-Reasonix/tree/v1) branch (maintenance only).
@@ -44,6 +45,8 @@
 > **Community · 加入社区** — bilingual Discord for setup help (`#help` / `#求助`), workflow showcases, and feature ideas. → **<https://discord.gg/XF78rEME2D>**
 
 <br/>
+
+
 
 ## Features
 
