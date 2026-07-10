@@ -4,9 +4,12 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"os"
+	"path/filepath"
 	"reasonix/internal/event"
 	"strings"
 	"testing"
+	"time"
 
 	"reasonix/internal/provider"
 	"reasonix/internal/tool"
@@ -87,11 +90,11 @@ func TestCoordinatorHandsPlanToExecutor(t *testing.T) {
 // TestHandoffTaskRecoversOriginalInput guards the dual-model auto-title path
 // (#3860): previews must surface the user's words, not handoff boilerplate.
 func TestHandoffTaskRecoversOriginalInput(t *testing.T) {
-	if got := HandoffTask(formatHandoff("修复登录页的 bug", "1. read login.go", "")); got != "修复登录页的 bug" {
+	if got := HandoffTask(formatHandoff("修复登录页的 bug", "1. read login.go")); got != "修复登录页的 bug" {
 		t.Errorf("HandoffTask(handoff) = %q, want the original task", got)
 	}
 	multi := "fix the bug\n\nsteps:\n- a\n- b"
-	if got := HandoffTask(formatHandoff(multi, "plan", "")); got != multi {
+	if got := HandoffTask(formatHandoff(multi, "plan")); got != multi {
 		t.Errorf("HandoffTask(multi-line) = %q, want %q", got, multi)
 	}
 	for _, plain := range []string{"ordinary input", "", "# Reasonix executor handoff with no sections"} {
@@ -826,5 +829,176 @@ func TestCoordinatorResetPlannerSessionClearsSummary(t *testing.T) {
 	coord.ResetPlannerSession()
 	if coord.lastExecutorSummary != "" {
 		t.Error("summary should be cleared after ResetPlannerSession")
+	}
+}
+
+// TestCoordinatorPlannerCacheLifecycle verifies the full planner cache cycle:
+//  1. Save — a coordinator with cache dir writes cache after planning.
+//  2. Restore — a fresh coordinator with the same cache dir loads the session.
+//  3. No-overwrite — when the session already has user content, the cache is
+//     not re-loaded, so in-process state is preserved.
+func TestCoordinatorPlannerCacheLifecycle(t *testing.T) {
+	dir := t.TempDir()
+	cachePath := filepath.Join(dir, "planner", "planner-cache.json")
+
+	// --- Phase 1: First coordinator saves cache to disk ---
+	planner1 := &mockProvider{
+		name:   "planner",
+		chunks: []provider.Chunk{{Type: provider.ChunkText, Text: "PLAN: audit codebase"}},
+	}
+	exec1 := New(&mockProvider{name: "exec"}, tool.NewRegistry(), NewSession("exec sys"), Options{}, event.Discard)
+	coord1 := NewCoordinator(planner1, NewSession("planner sys"), nil, nil, Options{}, exec1, 0, event.Discard, nil, dir)
+
+	plan, err := coord1.plan(context.Background(), "audit main.go for bugs")
+	if err != nil {
+		t.Fatalf("phase 1 plan: %v", err)
+	}
+	if !strings.Contains(plan, "audit codebase") {
+		t.Errorf("phase 1 plan = %q, want 'audit codebase'", plan)
+	}
+
+	// Verify cache file was created on disk
+	if _, err := os.Stat(cachePath); err != nil {
+		t.Fatalf("cache file not created after plan: %v", err)
+	}
+
+	// Verify cache has the session messages (sys + user + assistant)
+	cached := LoadPlannerCache(dir)
+	if len(cached) < 3 {
+		t.Fatalf("cached messages = %d, want >= 3 (sys+user+assistant)", len(cached))
+	}
+
+	// --- Phase 2: Fresh coordinator loads cache on first plan ---
+	planner2 := &mockProvider{
+		name:   "planner",
+		chunks: []provider.Chunk{{Type: provider.ChunkText, Text: "PLAN: fix the bug"}},
+	}
+	exec2 := New(&mockProvider{name: "exec"}, tool.NewRegistry(), NewSession("exec sys"), Options{}, event.Discard)
+	freshSess := NewSession("planner sys") // no history — simulates a restart
+	coord2 := NewCoordinator(planner2, freshSess, nil, nil, Options{}, exec2, 0, event.Discard, nil, dir)
+
+	// Before the first plan, maybeRestorePlannerCache should load cached history
+	plan2, err := coord2.plan(context.Background(), "fix the race condition")
+	if err != nil {
+		t.Fatalf("phase 2 plan: %v", err)
+	}
+	if !strings.Contains(plan2, "fix the bug") {
+		t.Errorf("phase 2 plan = %q, want 'fix the bug'", plan2)
+	}
+
+	// Verify old history from phase 1 is present in the restored session
+	msgs := coord2.plannerSess.Messages
+	foundOldTask := false
+	foundOldPlan := false
+	for _, m := range msgs {
+		if strings.Contains(m.Content, "audit main.go for bugs") {
+			foundOldTask = true
+		}
+		if m.Role == provider.RoleAssistant && strings.Contains(m.Content, "audit codebase") {
+			foundOldPlan = true
+		}
+	}
+	if !foundOldTask {
+		t.Error("restored planner session missing old task from cache")
+	}
+	if !foundOldPlan {
+		t.Error("restored planner session missing old plan from cache")
+	}
+
+	// --- Phase 3: Session with content does NOT reload cache ---
+	// coord2 already has history. Calling plan again should not reload the cache.
+	sessBefore := len(coord2.plannerSess.Messages)
+	plan3, err := coord2.plan(context.Background(), "add more tests")
+	if err != nil {
+		t.Fatalf("phase 3 plan: %v", err)
+	}
+	if !strings.Contains(plan3, "fix the bug") {
+		t.Errorf("phase 3 plan = %q, want 'fix the bug'", plan3)
+	}
+
+	// Verify the session grew (new task + new plan added) and old content kept
+	sessAfter := len(coord2.plannerSess.Messages)
+	if sessAfter <= sessBefore {
+		t.Errorf("session should grow after second plan: before=%d, after=%d", sessBefore, sessAfter)
+	}
+	foundNewTask := false
+	for _, m := range coord2.plannerSess.Messages {
+		if strings.Contains(m.Content, "add more tests") {
+			foundNewTask = true
+			break
+		}
+	}
+	if !foundNewTask {
+		t.Error("second plan's task not found in session — session was likely replaced")
+	}
+}
+
+// TestCoordinatorPlannerCacheExpired verifies that expired planner cache
+// (TTL > 1 hour) is discarded and the planner starts with a fresh session.
+func TestCoordinatorPlannerCacheExpired(t *testing.T) {
+	dir := t.TempDir()
+	cachePath := filepath.Join(dir, "planner", "planner-cache.json")
+
+	// --- Phase 1: Save a valid cache ---
+	planner1 := &mockProvider{
+		name:   "planner",
+		chunks: []provider.Chunk{{Type: provider.ChunkText, Text: "PLAN: old work"}},
+	}
+	exec1 := New(&mockProvider{name: "exec"}, tool.NewRegistry(), NewSession("exec sys"), Options{}, event.Discard)
+	coord1 := NewCoordinator(planner1, NewSession("planner sys"), nil, nil, Options{}, exec1, 0, event.Discard, nil, dir)
+
+	if _, err := coord1.plan(context.Background(), "old task"); err != nil {
+		t.Fatalf("phase 1 plan: %v", err)
+	}
+	if _, err := os.Stat(cachePath); err != nil {
+		t.Fatalf("cache file not created: %v", err)
+	}
+
+	// --- Phase 2: Manually expire the cache (set UpdatedAt >TTL in past) ---
+	old := plannerCache{
+		Version:   plannerCacheVersion,
+		CreatedAt: time.Now().Add(-2 * PlannerCacheTTL),
+		UpdatedAt: time.Now().Add(-2 * PlannerCacheTTL),
+		Messages: []provider.Message{
+			{Role: provider.RoleUser, Content: "stale task"},
+		},
+	}
+	if err := writePlannerCache(cachePath, &old); err != nil {
+		t.Fatalf("write expired cache: %v", err)
+	}
+
+	// Verify LoadPlannerCache returns nil (expired)
+	if cached := LoadPlannerCache(dir); cached != nil {
+		t.Fatal("LoadPlannerCache should return nil for expired cache")
+	}
+	// Verify the expired file was cleaned up
+	if _, err := os.Stat(cachePath); !os.IsNotExist(err) {
+		t.Error("expired cache file should be removed")
+	}
+
+	// --- Phase 3: Fresh coordinator with same dir — cache should NOT restore ---
+	freshSess := NewSession("planner sys")
+	coord2 := NewCoordinator(
+		&mockProvider{name: "planner2", chunks: []provider.Chunk{{Type: provider.ChunkText, Text: "PLAN: fresh start"}}},
+		freshSess, nil, nil, Options{},
+		New(&mockProvider{name: "exec"}, tool.NewRegistry(), NewSession("exec sys"), Options{}, event.Discard),
+		0, event.Discard, nil, dir,
+	)
+
+	// RestorePlannerCache should have no effect since cache was expired
+	coord2.RestorePlannerCache()
+
+	// The planner session should have only the system message (no cached history)
+	if len(coord2.plannerSess.Messages) != 1 {
+		t.Errorf("planner session = %d messages after expired cache, want 1 (system only)", len(coord2.plannerSess.Messages))
+	}
+	if coord2.plannerSess.Messages[0].Role != provider.RoleSystem {
+		t.Error("first message should be system prompt for a fresh session")
+	}
+	// The expired cache should NOT appear in the session
+	for _, m := range coord2.plannerSess.Messages {
+		if strings.Contains(m.Content, "stale task") || strings.Contains(m.Content, "old task") {
+			t.Errorf("expired cache leaked into fresh planner session: %q", m.Content)
+		}
 	}
 }

@@ -458,6 +458,7 @@ func New(opts Options) *Controller {
 	// Checkpoints: bind a store to the session and route writer pre-edits into it.
 	c.rebindCheckpoints(opts.SessionPath)
 	c.setActiveJobSession(opts.SessionPath)
+	c.bindPlannerToSession(opts.SessionPath)
 	cmdsInit := opts.Commands
 	c.commands.Store(&cmdsInit)
 	if c.executor != nil {
@@ -2122,7 +2123,7 @@ func (c *Controller) NewSession() error {
 	if c.guardianSess != nil {
 		c.guardianSess.Reset()
 	}
-	c.ResetPlannerSession()
+	c.bindPlannerToSession(c.SessionPath())
 	c.rebindCheckpoints(c.SessionPath())
 	c.snapshotMu.Unlock()
 	// A new session starts with no active goal: without this, a running goal's
@@ -2188,7 +2189,7 @@ func (c *Controller) ClearSession() error {
 	if c.guardianSess != nil {
 		c.guardianSess.Reset()
 	}
-	c.ResetPlannerSession()
+	c.bindPlannerToSession(c.SessionPath())
 	c.rebindCheckpoints(c.SessionPath())
 	c.snapshotMu.Unlock()
 	// Same contract as NewSession: the fresh session starts with no active goal.
@@ -2427,7 +2428,7 @@ func (c *Controller) forkNamed(turn int, name string, switchToFork bool) (string
 		// See snapshotMu: the swap must not interleave with an in-flight save.
 		c.snapshotMu.Lock()
 		c.executor.SetSession(sess)
-		c.ResetPlannerSession()
+		c.bindPlannerToSession(newPath)
 		c.mu.Lock()
 		c.sessionPath = newPath
 		c.guardianPath = guardian.PathFor(newPath)
@@ -2506,7 +2507,7 @@ func (c *Controller) Branch(name string) (string, error) {
 	// See snapshotMu: the swap must not interleave with an in-flight save.
 	c.snapshotMu.Lock()
 	c.executor.SetSession(sess)
-	c.ResetPlannerSession()
+	c.bindPlannerToSession(newPath)
 	c.mu.Lock()
 	c.sessionPath = newPath
 	c.guardianPath = guardian.PathFor(newPath)
@@ -2567,7 +2568,7 @@ func (c *Controller) SwitchBranch(ref string) (agent.BranchInfo, error) {
 	if c.executor != nil {
 		c.executor.SetSession(loaded)
 	}
-	c.ResetPlannerSession()
+	c.bindPlannerToSession(match.Path)
 	c.mu.Lock()
 	c.sessionPath = match.Path
 	c.guardianPath = guardian.PathFor(match.Path)
@@ -2686,11 +2687,15 @@ func (c *Controller) Resume(s *agent.Session, path string) {
 	if c.executor != nil {
 		c.executor.SetSession(s)
 	}
-	c.ResetPlannerSession()
+	// Bind the planner cache to the resumed session and restore saved
+	// planner context so the planner remembers research across restarts.
+	// This replaces the boot-time empty planner session with the cached
+	// messages for this specific session file.
 	c.mu.Lock()
 	c.sessionPath = path
 	c.guardianPath = guardian.PathFor(path)
 	c.mu.Unlock()
+	c.bindPlannerToSession(path)
 	c.setActiveJobSession(path)
 	c.rebindCheckpoints(path)
 	c.goals.restoreRunningFromState(path)
@@ -3116,7 +3121,7 @@ func (c *Controller) adoptDiskSession(path string) bool {
 		return false
 	}
 	c.executor.SetSession(loaded)
-	c.ResetPlannerSession()
+	c.bindPlannerToSession(path)
 	c.rebindCheckpoints(path)
 	c.setActiveJobSession(path)
 	return true
@@ -3333,6 +3338,31 @@ func (c *Controller) snapshotActivityIfChanged(startMessages int) {
 	}
 }
 
+// plannerCacheDirForSession returns the directory that should hold the planner
+// cache for a given session file path. The cache is stored alongside the
+// session file in a subdirectory named after the session (minus extension).
+func plannerCacheDirForSession(sessionPath string) string {
+	if sessionPath == "" {
+		return ""
+	}
+	return strings.TrimSuffix(sessionPath, filepath.Ext(sessionPath))
+}
+
+// bindPlannerToSession updates the planner cache directory to the given
+// session path, clears the in-memory planner session, and restores any
+// previously saved cache. This ensures each executor session has its own
+// planner context, surviving agent restarts within the TTL window.
+func (c *Controller) bindPlannerToSession(sessionPath string) {
+	coord, ok := c.runner.(*agent.Coordinator)
+	if !ok {
+		return
+	}
+	cacheDir := plannerCacheDirForSession(sessionPath)
+	coord.SetPlannerCacheDir(cacheDir)
+	coord.ResetPlannerSessionOnly()
+	coord.RestorePlannerCache()
+}
+
 // SetSessionPath pins where auto-save lands (a fresh session file minted by the
 // caller when no resume path applies).
 func (c *Controller) SetSessionPath(p string) {
@@ -3343,6 +3373,7 @@ func (c *Controller) SetSessionPath(p string) {
 	c.sessionPath = p
 	c.guardianPath = guardian.PathFor(p)
 	c.mu.Unlock()
+	c.bindPlannerToSession(p)
 	c.setActiveJobSession(p)
 	c.rebindCheckpoints(p)
 }

@@ -1074,6 +1074,12 @@ func Build(ctx context.Context, opts Options) (*control.Controller, error) {
 			if err != nil {
 				return nil, fmt.Errorf("planner %q: %w", pm, err)
 			}
+
+			// The planner cache directory is set to the session directory so
+			// the planner's conversation history can be persisted and restored
+			// per-session. The controller (Resume, SetSessionPath, etc.) binds
+			// the cache to the specific session path after it is determined.
+			plannerCacheDir := sessionDir
 			plannerSess := agent.NewSession(agent.PlannerPromptWithContext(mem.Block()))
 			plannerTools := agent.PlannerToolRegistry(reg, cfg.Agent.PlannerAllowedTools...)
 			runner = agent.NewCoordinator(plannerProv, plannerSess, pe.Price, plannerTools, agent.Options{
@@ -1091,7 +1097,7 @@ func Build(ctx context.Context, opts Options) (*control.Controller, error) {
 				ReasoningLanguage:        cfg.ReasoningLanguage(),
 				PlanModeAllowedTools:     cfg.Agent.PlannerAllowedTools,
 				PlanModeReadOnlyCommands: cfg.Agent.PlanModeReadOnlyCommands,
-			}, executor, cfg.Agent.Temperature, sink, control.NewPlannerGate(classifier))
+			}, executor, cfg.Agent.Temperature, sink, control.NewPlannerGate(classifier), plannerCacheDir)
 			label = entry.Model + " + planner " + pe.Model
 		}
 	}

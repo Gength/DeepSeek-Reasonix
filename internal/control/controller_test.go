@@ -2028,7 +2028,11 @@ func TestNewSessionResetsTwoModelPlannerContext(t *testing.T) {
 	}
 }
 
-func TestResumeResetsTwoModelPlannerContext(t *testing.T) {
+// TestResumeClearsPlannerContextWhenSwitchingSessions verifies that Resume()
+// clears the in-memory planner session when switching to a different executor
+// session. The planner cache is per-session, so the old session's context is
+// saved to its own cache dir and not leaked into the resumed session.
+func TestResumeClearsPlannerContextWhenSwitchingSessions(t *testing.T) {
 	dir := t.TempDir()
 	planner := &recordingProvider{name: "planner", streams: [][]provider.Chunk{
 		textTurn("OLD PLAN: inspect alpha.go"),
@@ -3900,6 +3904,99 @@ func TestReloadCommandsDesktopManagementNotice(t *testing.T) {
 	}
 	if !strings.Contains(notices[0], "0 available") {
 		t.Errorf("notice for empty set = %q, want '0 available'", notices[0])
+	}
+}
+
+// TestPlannerCachePerSessionIsolation verifies that each executor session has
+// its own independent planner cache: cache is saved per-session path, resumed
+// sessions restore their own cached planner context, and switching sessions
+// does not leak planner state between them.
+func TestPlannerCachePerSessionIsolation(t *testing.T) {
+	dir := t.TempDir()
+	sessionAPath := filepath.Join(dir, "sessionA.jsonl")
+	sessionBPath := filepath.Join(dir, "sessionB.jsonl")
+
+	// Three planner turns: session A, session B (fresh), session A (resumed).
+	planner := &recordingProvider{name: "planner", streams: [][]provider.Chunk{
+		textTurn("PLAN A: inspect main.go"),
+		textTurn("PLAN B: fix bug.go"),
+		textTurn("PLAN A2: review the fix"),
+	}}
+	execProv := &recordingProvider{name: "executor", streams: [][]provider.Chunk{
+		textTurn("done A"),
+		textTurn("done B"),
+		textTurn("done A2"),
+	}}
+
+	exec := agent.New(execProv, tool.NewRegistry(), agent.NewSession("exec sys"), agent.Options{}, event.Discard)
+	plannerSess := agent.NewSession("planner sys")
+	coord := agent.NewCoordinator(planner, plannerSess, nil, tool.NewRegistry(), agent.Options{}, exec, 0, event.Discard, nil)
+	c := New(Options{Runner: coord, Executor: exec, SystemPrompt: "exec sys", SessionDir: dir, SessionPath: sessionAPath, Label: "test"})
+
+	// --- Phase 1: Plan on session A --- cache saved at A's per-session path ---
+	if err := c.Run(context.Background(), "task A: inspect main.go"); err != nil {
+		t.Fatal(err)
+	}
+	cacheAPath := strings.TrimSuffix(sessionAPath, ".jsonl") + "/planner/planner-cache.json"
+	if _, err := os.Stat(cacheAPath); os.IsNotExist(err) {
+		t.Fatalf("cache for session A not created: %v", err)
+	}
+
+	// --- Phase 2: Resume to session B --- fresh planner, independent cache ---
+	sessB := agent.NewSession("exec sys")
+	sessB.Add(provider.Message{Role: provider.RoleUser, Content: "saved B"})
+	c.Resume(sessB, sessionBPath)
+
+	if err := c.Run(context.Background(), "task B: fix bug.go"); err != nil {
+		t.Fatal(err)
+	}
+	cacheBPath := strings.TrimSuffix(sessionBPath, ".jsonl") + "/planner/planner-cache.json"
+	if _, err := os.Stat(cacheBPath); os.IsNotExist(err) {
+		t.Fatalf("cache for session B not created: %v", err)
+	}
+
+	// Verify A's cache still exists (not overwritten by session B)
+	if _, err := os.Stat(cacheAPath); os.IsNotExist(err) {
+		t.Fatal("session A cache was removed after session B ran")
+	}
+
+	// --- Phase 3: Resume back to session A --- cache should restore context ---
+	sessAResumed := agent.NewSession("exec sys")
+	sessAResumed.Add(provider.Message{Role: provider.RoleUser, Content: "saved A"})
+	c.Resume(sessAResumed, sessionAPath)
+
+	if err := c.Run(context.Background(), "task A2: review the fix"); err != nil {
+		t.Fatal(err)
+	}
+
+	// The third planner request (index 2) should contain session A's cached context
+	if len(planner.requests) < 3 {
+		t.Fatalf("planner requests = %d, want at least 3", len(planner.requests))
+	}
+	thirdReq := requestMessagesText(planner.requests[2].Messages)
+
+	// Must contain the old task from session A's cache
+	if !strings.Contains(thirdReq, "task A: inspect main.go") {
+		t.Errorf("resumed session A planner missing cached task:\n%s", thirdReq)
+	}
+	// Must contain the old plan from session A's cache
+	if !strings.Contains(thirdReq, "PLAN A: inspect main.go") {
+		t.Errorf("resumed session A planner missing cached plan:\n%s", thirdReq)
+	}
+	// Must contain the current task
+	if !strings.Contains(thirdReq, "task A2") {
+		t.Errorf("resumed session A planner missing current task:\n%s", thirdReq)
+	}
+
+	// Phase 2's planner request (index 1) must NOT contain session A's context
+	if len(planner.requests) >= 2 {
+		secondReq := requestMessagesText(planner.requests[1].Messages)
+		if strings.Contains(secondReq, "task A: inspect main.go") {
+			t.Errorf("session B planner leaked context from session A:\n%s", secondReq)
+		}
+		if strings.Contains(secondReq, "PLAN A: inspect main.go") {
+			t.Errorf("session B planner leaked plan from session A:\n%s", secondReq)
+		}
 	}
 }
 

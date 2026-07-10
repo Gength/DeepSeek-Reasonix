@@ -37,6 +37,15 @@ branch.
   executor-ready plan. This prevents the planner from attempting side-effect
   tools, failing, and recovering — saving tokens. (`internal/agent/coordinator.go`)
 
+- **Planner session temporary cache**: The planner's conversation history is
+  now persisted to disk after each plan and automatically restored on restart
+  within a 4-hour TTL window counted from the last save (each plan refreshes
+  the timer). This prevents planner context loss when the agent restarts
+  (e.g. a crash or manual restart during an ongoing task). The cache is
+  cleared on tab/branch switches via `ResetPlannerSession`.
+  (`internal/agent/planner_cache.go`, `internal/agent/coordinator.go`,
+  `internal/boot/boot.go`)
+
 ### Changed
 
 - Agent runtime defaults now leave both executor and dedicated planner tool-call
@@ -45,14 +54,6 @@ branch.
   override them.
 
 ### Fixed
-
-- **Planner tool results forwarded to executor**: When the planner calls
-  read-only tools (e.g. `web_fetch`, `web_search`), those results were
-  stored in the planner session but never forwarded to the executor during
-  handoff. The executor, unaware of what the planner already fetched, would
-  repeat the same tool calls — wasting tokens and API quota. Now the handoff
-  prompt includes a compact summary of planner tool calls so the executor
-  never repeats them. (#4051, `internal/agent/coordinator.go`)
 
 ## [1.0.0] — 2026-06-03
 

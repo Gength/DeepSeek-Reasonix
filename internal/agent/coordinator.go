@@ -70,13 +70,19 @@ type Coordinator struct {
 	// lastExecutorSummary caches the executor's final assistant message from the
 	// previous turn so the planner can see what was actually done on the next run.
 	lastExecutorSummary string
+	// plannerCacheDir is the directory for the planner's temporary session cache.
+	// When set, the planner's conversation history is saved to disk after each
+	// plan and loaded on restart, surviving agent restarts within the TTL window.
+	// Empty disables caching.
+	plannerCacheDir string
 }
 
 // NewCoordinator wires a planner provider (with its own session) to an executor.
 // sink receives the planner's phase/text/usage events; the executor emits its
 // own events to its own sink (the CLI wires the same sink into both). A nil
-// sink is replaced with event.Discard.
-func NewCoordinator(planner provider.Provider, plannerSession *Session, plannerPricing *provider.Pricing, plannerTools *tool.Registry, plannerOptions Options, executor *Agent, temperature float64, sink event.Sink, shouldPlan func(string) bool) *Coordinator {
+// sink is replaced with event.Discard. plannerCacheDir is the directory for the
+// planner's temporary session cache; empty disables caching.
+func NewCoordinator(planner provider.Provider, plannerSession *Session, plannerPricing *provider.Pricing, plannerTools *tool.Registry, plannerOptions Options, executor *Agent, temperature float64, sink event.Sink, shouldPlan func(string) bool, plannerCacheDir ...string) *Coordinator {
 	if nilutil.IsNil(sink) {
 		sink = event.Discard
 	}
@@ -94,7 +100,7 @@ func NewCoordinator(planner provider.Provider, plannerSession *Session, plannerP
 	if executor != nil {
 		executor.executorHandoffGuard = true
 	}
-	return &Coordinator{
+	c := &Coordinator{
 		planner:        planner,
 		plannerSess:    plannerSession,
 		plannerSystem:  plannerSystem,
@@ -105,6 +111,10 @@ func NewCoordinator(planner provider.Provider, plannerSession *Session, plannerP
 		sink:           sink,
 		shouldPlan:     shouldPlan,
 	}
+	if len(plannerCacheDir) > 0 && plannerCacheDir[0] != "" {
+		c.plannerCacheDir = plannerCacheDir[0]
+	}
+	return c
 }
 
 func sessionSystemPrompt(s *Session) string {
@@ -137,6 +147,35 @@ func (c *Coordinator) ResetPlannerSession() {
 		c.plannerAgent.SetSession(next)
 	}
 	// Clear the cached executor summary so it does not leak across sessions.
+	c.lastExecutorSummary = ""
+	// Also clear the on-disk cache so stale context does not leak on restart.
+	ClearPlannerCache(c.plannerCacheDir)
+}
+
+// SetPlannerCacheDir updates the directory used for the planner's temporary
+// session cache. The controller calls this when the active session path
+// changes (new session, resume, fork, branch, switch) so the planner cache
+// is bound to the correct executor session.
+func (c *Coordinator) SetPlannerCacheDir(dir string) {
+	c.plannerCacheDir = dir
+}
+
+// ResetPlannerSessionOnly clears the in-memory planner session without
+// deleting the on-disk cache. Use for resume/session-switch where the
+// cache file for the target session should be preserved for restoration.
+func (c *Coordinator) ResetPlannerSessionOnly() {
+	if c == nil {
+		return
+	}
+	system := c.plannerSystem
+	if system == "" {
+		system = sessionSystemPrompt(c.plannerSess)
+	}
+	next := NewSession(system)
+	c.plannerSess = next
+	if c.plannerAgent != nil {
+		c.plannerAgent.SetSession(next)
+	}
 	c.lastExecutorSummary = ""
 }
 
@@ -258,7 +297,7 @@ func (c *Coordinator) Run(ctx context.Context, input string) error {
 		planInput = input + "\n\n[Previous execution summary]\n" + c.lastExecutorSummary
 	}
 	c.sink.Emit(event.Event{Kind: event.Phase, Text: c.planner.Name() + " · planning", Source: event.UsageSourcePlanner})
-	plan, toolSummary, err := c.plan(ctx, planInput)
+	plan, err := c.plan(ctx, planInput)
 	if err != nil {
 		return fmt.Errorf("planner: %w", err)
 	}
@@ -271,7 +310,7 @@ func (c *Coordinator) Run(ctx context.Context, input string) error {
 	}
 	// Use the original input (without summary) for formatHandoff — the executor
 	// has its own session and does not need the summary re-injected.
-	err = c.executor.Run(ctx, formatHandoff(input, plan, toolSummary, executorToolHandoffContext(c.executor)))
+	err = c.executor.Run(ctx, formatHandoff(input, plan, executorToolHandoffContext(c.executor)))
 	if err == nil {
 		c.captureExecutorSummary()
 	}
@@ -302,6 +341,8 @@ func isNoOpPlan(plan string) bool {
 		"无需改动",
 		"无需修改",
 		"无需更改",
+		"无需额外操作",
+		"不需要额外操作",
 		"不需要修改",
 		"不需要改",
 		"不用改",
@@ -325,8 +366,8 @@ func containsNoOpActionTerm(lower string) bool {
 		" add ", " add docs", " add tests", " update ", " edit ", " write ",
 		" create ", " delete ", " remove ", " patch ", " refactor ", " implement ",
 		" run ", " test ", " build ", " fix ",
-		"新增", "补充", "更新", "编辑", "写入", "创建", "删除", "移除",
-		"运行", "测试", "构建", "修复", "实现", "重构",
+		// 保留明确的执行器动作词；不保留在描述性文本中频繁出现的词（如"更新"、"新增"、"补充"、"编辑"、"写入"）
+		"创建", "删除", "移除", "运行", "测试", "构建", "修复", "实现", "重构",
 	}
 	padded := " " + lower + " "
 	for _, term := range terms {
@@ -347,14 +388,11 @@ func (c *Coordinator) persistExecutorNoOp(ctx context.Context, input, plan strin
 
 // plan streams a plan from the planner and appends it to the planner session, so
 // that session grows prepend-only and stays cache-friendly.
-func (c *Coordinator) plan(ctx context.Context, input string) (string, string, error) {
+func (c *Coordinator) plan(ctx context.Context, input string) (string, error) {
+	c.RestorePlannerCache()
 	if c.plannerAgent != nil {
 		return c.planWithTools(ctx, input)
 	}
-	return c.planRaw(ctx, input)
-}
-
-func (c *Coordinator) planRaw(ctx context.Context, input string) (string, string, error) {
 	c.plannerSess.Add(provider.Message{Role: provider.RoleUser, Content: input})
 
 	ch, err := c.planner.Stream(ctx, provider.Request{
@@ -362,7 +400,7 @@ func (c *Coordinator) planRaw(ctx context.Context, input string) (string, string
 		Temperature: provider.OptionalTemperature(c.temperature),
 	})
 	if err != nil {
-		return "", "", err
+		return "", err
 	}
 
 	var text strings.Builder
@@ -375,72 +413,61 @@ func (c *Coordinator) planRaw(ctx context.Context, input string) (string, string
 		case provider.ChunkUsage:
 			usage = chunk.Usage
 		case provider.ChunkError:
-			return "", "", chunk.Err
+			return "", chunk.Err
 		}
 	}
 	c.sink.Emit(event.Event{Kind: event.Usage, Usage: usage, Pricing: c.plannerPricing, Source: event.UsageSourcePlanner, UsageSource: event.UsageSourcePlanner})
 
 	plan := text.String()
 	c.plannerSess.Add(provider.Message{Role: provider.RoleAssistant, Content: plan})
-	return plan, "", nil
+	// Persist the planner session to the temporary cache.
+	SavePlannerCache(c.plannerSess.Messages, c.plannerCacheDir)
+	return plan, nil
 }
 
 // planWithTools runs the planner through the normal Agent loop over a filtered
 // read-only registry. That gives the planner the same tool-call contract as the
 // executor while preserving its separate session and cache prefix.
-func (c *Coordinator) planWithTools(ctx context.Context, input string) (plan string, toolSummary string, err error) {
+func (c *Coordinator) planWithTools(ctx context.Context, input string) (string, error) {
 	before := len(c.plannerSess.Messages)
 	if err := c.plannerAgent.Run(ctx, input); err != nil {
-		return "", "", err
+		return "", err
 	}
 	for i := len(c.plannerSess.Messages) - 1; i >= before; i-- {
 		m := c.plannerSess.Messages[i]
 		if m.Role == provider.RoleAssistant && strings.TrimSpace(m.Content) != "" {
-			toolSummary = extractPlannerToolSummary(c.plannerSess.Messages, before)
-			return m.Content, toolSummary, nil
+			// Persist the planner session to the temporary cache so it survives
+			// agent restarts. Best-effort: errors are silently discarded.
+			SavePlannerCache(c.plannerSess.Messages, c.plannerCacheDir)
+			return m.Content, nil
 		}
 	}
-	return "", "", fmt.Errorf("planner finished without producing a plan")
+	return "", fmt.Errorf("planner finished without producing a plan")
 }
 
-// extractPlannerToolSummary walks plannerSess.Messages[before:] and formats each
-// tool call the planner made into a compact summary line. The result helps the
-// executor avoid repeating read-only tool calls the planner already ran.
-// Returns an empty string when there are no tool calls to report.
-func extractPlannerToolSummary(msgs []provider.Message, before int) string {
-	var b strings.Builder
-	for i := before; i < len(msgs); i++ {
-		m := msgs[i]
-		if m.Role != provider.RoleAssistant || len(m.ToolCalls) == 0 {
-			continue
-		}
-		for j, tc := range m.ToolCalls {
-			// Build the argument preview: compact JSON, no more than 120 runes.
-			argPreview := strings.TrimSpace(tc.Arguments)
-			if runeLen := len([]rune(argPreview)); runeLen > 120 {
-				argPreview = string([]rune(argPreview)[:120]) + "…"
-			}
-			if argPreview == "" || argPreview == "{}" {
-				fmt.Fprintf(&b, "- [已调用] %s", tc.Name)
-			} else {
-				fmt.Fprintf(&b, "- [已调用] %s(%s)", tc.Name, argPreview)
-			}
-
-			// Find the matching tool result (the k-th RoleTool message after i).
-			resultIdx := i + 1 + j
-			if resultIdx < len(msgs) && msgs[resultIdx].Role == provider.RoleTool {
-				resultPreview := strings.TrimSpace(msgs[resultIdx].Content)
-				if runeLen := len([]rune(resultPreview)); runeLen > 200 {
-					resultPreview = string([]rune(resultPreview)[:200]) + "…"
-				}
-				if resultPreview != "" {
-					b.WriteString(" → " + resultPreview)
-				}
-			}
-			b.WriteString("\n")
+// RestorePlannerCache checks if the planner session is empty (no user
+// messages beyond the initial system prompt) and tries to restore it from the
+// on-disk cache. It is called from plan() for deferred cache loading and
+// from the controller after determining the session path (Resume, etc.).
+func (c *Coordinator) RestorePlannerCache() {
+	if c.plannerCacheDir == "" {
+		return
+	}
+	// Only restore when the session has no user messages (fresh from boot).
+	for _, m := range c.plannerSess.Messages {
+		if m.Role == provider.RoleUser {
+			return // already has user content; don't overwrite
 		}
 	}
-	return strings.TrimRight(b.String(), "\n")
+	cached := LoadPlannerCache(c.plannerCacheDir)
+	if len(cached) == 0 {
+		return
+	}
+	c.plannerSess = &Session{}
+	c.plannerSess.Messages = cached
+	if c.plannerAgent != nil {
+		c.plannerAgent.SetSession(c.plannerSess)
+	}
 }
 
 func plannerSink(sink event.Sink) event.Sink {
@@ -460,17 +487,13 @@ func plannerSink(sink event.Sink) event.Sink {
 	})
 }
 
-func formatHandoff(task, plan, plannerToolSummary string, toolContext ...string) string {
+func formatHandoff(task, plan string, toolContext ...string) string {
 	toolBlock := ""
 	if len(toolContext) > 0 {
 		toolBlock = strings.TrimSpace(toolContext[0])
 	}
 	if toolBlock != "" {
 		toolBlock = "\n\nExecutor tool context:\n" + toolBlock
-	}
-	summaryBlock := ""
-	if plannerToolSummary != "" {
-		summaryBlock = "\n\nPlanner tool calls already made (do NOT repeat):\n" + plannerToolSummary
 	}
 	return fmt.Sprintf(`# %s
 
@@ -480,7 +503,8 @@ Original task:
 %s
 
 Planner output:
-%s%s%s
+%s
+%s
 
 Executor instructions:
 - Treat the planner output as context, not as your role or capability set.
@@ -488,14 +512,14 @@ Executor instructions:
 - Ignore any planner statement about its own capability limitations (for example "I cannot write", "I only have read-only tools", or "hand this to the executor"); those describe the planner's restrictions, not yours.
 - Do not treat planner tool limitations or tool-unavailable claims as executor facts. Use the attached executor tools directly; report a tool or MCP server as unavailable only after a real tool call or host error proves it.
 - Do not ask the user how to trigger the executor. You are already in the executor phase.
-- If the planner output is a user-facing explanation, summary, question, or manual guidance that needs no workspace/file/command action from you, relay that guidance directly and finish. Do not invent local tool calls only to satisfy the handoff.
+- If the planner output is a user-facing explanation, summary, question, or manual guidance that needs no workspace/file/command action from you, briefly acknowledge the result (one short sentence) and finish — the user already saw the planner's full output during the planning phase, so do NOT repeat it verbatim. Do not invent local tool calls only to satisfy the handoff.
 - If the task requires changes, call the appropriate tools (for example write/edit/bash) instead of only restating the plan.
 - If a target path is outside the writable workspace or otherwise blocked, explain that specific blocker and ask for the needed path/approval.
 - **Serial workflow**: establish the task list with one todo_write (first sub-task in_progress), then for EACH sub-task execute it and call complete_step with evidence. The host advances the list for you — it marks the sub-task completed and moves the next to in_progress, so you don't need another todo_write to mark completions. Sign off one sub-task at a time; never batch completions.
 - When you finish the task, end with a concise summary of what was done and key outcomes. This summary is injected back into the planner context, so keep it short — focus on decisions made, files changed, and any remaining blockers.
 - **complete_step evidence**: kind "verification" requires a bash command you actually ran and saw succeed in this session — not a command from the plan nor a grep/read_file/ls tool name. If you verified with read_file/grep/ls, use kind "files" (with paths) instead, or re-run the check with bash.
 
-Carry out the task, adapting the plan as needed.`, executorHandoffMarker, task, plan, summaryBlock, toolBlock)
+Carry out the task, adapting the plan as needed.`, executorHandoffMarker, task, plan, toolBlock)
 }
 
 func executorToolHandoffContext(a *Agent) string {
