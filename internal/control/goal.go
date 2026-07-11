@@ -247,8 +247,10 @@ func (g *goalMachine) advance(in goalAdvanceInput) goalAdvanceResult {
 	default:
 		g.blocks = 0
 		g.block = ""
-		g.intercepts = 0
-		g.selfCheckDone = false
+		if in.toolCalled {
+			g.intercepts = 0
+			g.selfCheckDone = false
+		}
 		g.idleTurns = 0
 	}
 	// Idle detection: if the agent went multiple turns without any tool calls,

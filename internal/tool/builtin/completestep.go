@@ -352,11 +352,6 @@ func receiptHint(label string, items []string) string {
 	if len(items) == 0 {
 		return ""
 	}
-	for i, item := range items {
-		if len(item) > 80 {
-			items[i] = item[:80] + "…"
-		}
-	}
 	return fmt.Sprintf("; %s: %q — cite one as it actually ran, or run the check now", label, items)
 }
 
@@ -400,12 +395,6 @@ func allCommandHints(ctx context.Context, ledger *evidence.Ledger) string {
 	}
 	if len(cmds) == 0 {
 		return ""
-	}
-	// Truncate long entries for readability.
-	for i, c := range cmds {
-		if len(c) > 80 {
-			cmds[i] = c[:80] + "…"
-		}
 	}
 	return fmt.Sprintf("; commands that ran: %q — pick the matching one and retry complete_step", cmds)
 }
