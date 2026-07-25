@@ -37,6 +37,9 @@ func segmentCovered(cited string, ranSegs []string) bool {
 // segmentMatches accepts normalized equality, or a token subset with the same
 // head token (e.g. cited "ls x 2>&1" against ran "ls -la x 2>&1"). One-token
 // citations only match exactly, so a bare "ls" can't claim an unrelated run.
+// Trailing ellipsis ("..." or "…") on a cited token is relaxed to a prefix
+// match against ran tokens, so truncation by the model ("save..." → "save")
+// does not prevent matching the full token on disk.
 func segmentMatches(cited, ran string) bool {
 	ct, rt := segmentTokens(cited), segmentTokens(ran)
 	if len(ct) == 0 || len(rt) == 0 {
@@ -48,16 +51,32 @@ func segmentMatches(cited, ran string) bool {
 	if len(ct) < 2 || ct[0] != rt[0] {
 		return false
 	}
-	have := make(map[string]bool, len(rt))
-	for _, t := range rt {
-		have[t] = true
-	}
 	for _, t := range ct {
-		if !have[t] {
+		if !hasToken(t, rt) {
 			return false
 		}
 	}
 	return true
+}
+
+// hasToken reports whether token t is matched by one of the ranTokens. An exact
+// match is sufficient; a cited token ending with ellipsis may also be a truncated
+// form that only matches as a prefix of a longer ran token.
+func hasToken(cited string, ranTokens []string) bool {
+	for _, r := range ranTokens {
+		if cited == r {
+			return true
+		}
+	}
+	trimmed := strings.TrimSuffix(strings.TrimSuffix(cited, "..."), "…")
+	if trimmed != cited {
+		for _, r := range ranTokens {
+			if strings.HasPrefix(r, trimmed) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 var segmentSeparators = []string{"&&", "||", ";", "|", "\n"}

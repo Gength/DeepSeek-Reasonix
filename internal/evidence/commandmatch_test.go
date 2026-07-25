@@ -28,6 +28,19 @@ func TestCommandMatches(t *testing.T) {
 		{"empty cited", "", "go test ./...", false},
 		{"comment lines ignored", "shuf -i 1-30 -n 10",
 			"# pick lines to delete\nshuf -i 1-30 -n 10 | sort -rn", true},
+		// Truncation with trailing ellipsis: the model cited "save..." but
+		// the actual command continues with more text after "save". The
+		// ellipsis-stripped token must match as a prefix of the ran token.
+		{"truncated long argument with ellipsis",
+			`git commit -m "fix: close race between compact and snapshot save..."`,
+			`git commit -m "fix: close race between compact and snapshot save and more text"`,
+			true},
+		{"truncated Go test pattern is still exact match",
+			"go test ./internal/...", "go test ./internal/...", true},
+		// Token without trailing ellipsis must NOT prefix-match: "save"
+		// is a complete token and should only match an equal token.
+		{"no ellipsis means no prefix relaxation",
+			"go test ./internal/", "go test ./internal/...", false},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
