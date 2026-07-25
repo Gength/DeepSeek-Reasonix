@@ -201,6 +201,21 @@ func (s *Session) save(path string, mode sessionSaveMode) error {
 	// stalest capture written last would then read the newer transcript it
 	// lost the race to as a bogus stale-prefix conflict.
 	msgs, version, rewriteVersion := s.snapshotWithVersion()
+	// Auto-promote to rewrite mode when the captured rewriteVersion shows a
+	// pending in-memory rewrite that the caller's NeedsRewriteSave check may
+	// have missed due to a concurrent compact/prune/rewrite racing with this
+	// save's mode decision. The snapshotWithVersion capture is the authoritative
+	// frozen state: if its rewriteVersion exceeds persistedRewriteVersion, the
+	// messages were rewritten in memory and must be persisted as a rewrite to
+	// avoid a spurious diverged conflict against the on-disk transcript.
+	if mode == sessionSaveSnapshot {
+		s.mu.RLock()
+		pendingRewrite := rewriteVersion > s.persistedRewriteVersion
+		s.mu.RUnlock()
+		if pendingRewrite {
+			mode = sessionSaveRewrite
+		}
+	}
 	digest, contentBytes, err := digestAndSizeSessionMessages(msgs)
 	if err != nil {
 		return err

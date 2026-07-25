@@ -71,6 +71,19 @@ func (s *Session) Replace(msgs []provider.Message) {
 	s.version++
 }
 
+// Rewrite atomically replaces messages and marks that an in-memory rewrite
+// (compaction, prune) happened, bumping both version and rewriteVersion under
+// a single lock. Callers that previously called Replace+IncrementRewrite
+// should use Rewrite instead to close the race window where a concurrent
+// autosave sees the replaced messages but misses the rewrite flag.
+func (s *Session) Rewrite(msgs []provider.Message) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.Messages = msgs
+	s.version += 2 // matches Replace (version++) + IncrementRewrite (version++)
+	s.rewriteVersion++
+}
+
 // Snapshot returns a copy of the messages, safe to read from another goroutine
 // while a turn appends. Frontends (History, Save) use it instead of touching the
 // live slice.
